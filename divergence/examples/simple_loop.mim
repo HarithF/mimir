@@ -1,0 +1,12 @@
+// Not supported yet: a loop. The analysis must warn and fall back to varying.
+plugin core;
+
+fun extern loop(n: Nat): Nat =
+    head 0 where
+        con head(i: Nat) =
+            let c = %core.ncmp.l (i, n);
+            (exit, body)#c () where
+                con body() = head (%core.nat.add (i, 1));
+                con exit() = return i;
+            end;
+    end;
