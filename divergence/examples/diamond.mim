@@ -1,0 +1,13 @@
+plugin core;
+
+cfun dont_know[]: Bool;
+
+fun extern diamond(a: Nat): Nat =
+    ret c = dont_know $ ();
+    (f, t)#c () where
+        con t() = join (a, 1);
+        con f() = join (a, 2);
+        con join(x y: Nat) =
+            let r = %core.nat.add (x, y);
+            return r;
+    end;

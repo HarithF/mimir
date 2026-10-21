@@ -1,0 +1,13 @@
+plugin core;
+
+cfun dont_know[]: Nat;
+
+fun extern arms_one_join(a: Nat): Nat =
+    ret c = dont_know $ ();
+    let b = %core.ncmp.l (c, a);
+    (f, t)#b () where
+        con t() = join (c, 1);
+        con f() = return c;
+        con join(x y: Nat) =
+            return (%core.nat.add (x, y));
+    end;

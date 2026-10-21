@@ -1,0 +1,20 @@
+// values in scope at join are not affected by the divergent split.
+// - k is computed before the split and used directly in join: uniform.
+// - x receives the same Def k on both edges: it definitely reaches join, so uniform.
+// - y receives different Defs: varying.
+// - s = k + x is uniform, r = s + y is varying.
+plugin core;
+
+cfun dont_know[]: Bool;
+
+fun extern scoped(a: Nat): Nat =
+    let k = %core.nat.add (a, 1);
+    ret c = dont_know $ ();
+    (f, t)#c () where
+        con t() = join (k, 1);
+        con f() = join (k, 2);
+        con join(x y: Nat) =
+            let s = %core.nat.add (k, x);
+            let r = %core.nat.add (s, y);
+            return r;
+    end;
