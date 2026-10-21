@@ -12,13 +12,15 @@
 
 #include "divergence.h"
 
-/// Usage: `divergence [--dump] [--raw] [--nest] [--jumps] <file.mim>`
+/// Usage: `divergence [--dump] [--raw] [--control] <file.mim>`
 /// - `--dump`:  also dump the World that gets analysed.
 /// - `--raw`:   skip the BetaRed/EtaConv clean-up before the analysis.
+/// - `--control`: also print the ControlGraph of every external function.
 ///
 int main(int argc, char** argv) {
     bool dump = false;
     bool raw  = false;
+    bool ctrl = false;
 
     const char* input = nullptr;
 
@@ -27,11 +29,13 @@ int main(int argc, char** argv) {
             dump = true;
         else if (std::strcmp(argv[i], "--raw") == 0)
             raw = true;
+        else if (std::strcmp(argv[i], "--control") == 0)
+            ctrl = true;
         else
             input = argv[i];
 
     if (!input) {
-        std::println(std::cerr, "usage: {} [--dump] [--raw] <file.mim>", argv[0]);
+        std::println(std::cerr, "usage: {} [--dump] [--raw] [--control] <file.mim>", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -51,6 +55,7 @@ int main(int argc, char** argv) {
 
             auto analysis = mim::Divergence(world);
             analysis.run_to_fp();
+            if (ctrl) analysis.dump_control(std::cout);
             analysis.dump(std::cout);
         }
     } catch (const std::exception& e) {

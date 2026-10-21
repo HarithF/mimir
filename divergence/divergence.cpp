@@ -109,6 +109,18 @@ void Divergence::build(ControlGraph& g) {
     };
     dfs(g.root);
     g.topo.assign(post.rbegin(), post.rend());
+
+    // Opaque results are the sources of divergence.
+    for (auto n : g.topo)
+        if (auto lam = isa_block(n); lam && g.opaque_conts.contains(n))
+            for (size_t i = 0, e = lam->num_tvars(); i != e; ++i)
+                pin_tvar(lam, i);
+}
+
+void Divergence::pin_tvar(Lam* lam, size_t i) {
+    pin(lam->tvar(i));
+    // TODO: marking the whole Var as varying if any of its projections is, is conservative.
+    if (lam->num_tvars() > 1) pin(lam->var());
 }
 
 const Def* Divergence::rewrite_imm(const Def* def) {
@@ -127,6 +139,26 @@ const Def* Divergence::rewrite_imm(const Def* def) {
 //
 
 void Divergence::dump(std::ostream& os) {
+    auto fact = [&](const Def* def) { return is_varying(def) ? "varying" : "uniform"; };
+
+    for (const auto& g : graphs_) {
+        std::println(os, "{}:", g.root->unique_name());
+        for (auto n : g.topo) {
+            auto lam = isa_block(n);
+            if (!lam || lam == g.root) continue;
+
+            std::print(os, "    {}(", lam->unique_name());
+            for (size_t i = 0, e = lam->num_tvars(); i != e; ++i)
+                std::print(os, "{}{}: {}", i ? ", " : "", lam->tvar(i)->unique_name(), fact(lam->tvar(i)));
+            std::print(os, ")");
+            if (auto i = g.splits.find(lam); i != g.splits.end())
+                std::print(os, "   split on {}: {}", i->second->unique_name(), fact(i->second));
+            std::println(os);
+        }
+    }
+}
+
+void Divergence::dump_control(std::ostream& os) {
     for (const auto& g : graphs_) {
         std::println(os, "{}:", g.root->unique_name());
         for (auto n : g.topo) {

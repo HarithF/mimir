@@ -28,6 +28,7 @@ public:
     bool is_uniform(const Def* def) const { return !is_varying(def); }
 
     void dump(std::ostream&);
+    void dump_control(std::ostream&);
 
 private:
     /// The control-flow graph of the continuations of one external function, derived from the IR:
