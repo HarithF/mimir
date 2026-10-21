@@ -50,11 +50,17 @@ private:
 
     void prepare() final;
     const Def* rewrite_imm(const Def*) final;
+    const Def* rewrite_imm_App(const App*) final;
 
     void build(ControlGraph&);
     // records @p split in ControlGraph::sync_deps of every node where two disjoint paths meet.
     void label_disjoint(ControlGraph&, Lam* split, const DefVec& sources);
 
+    /// The abstract transformer F♯_Uni
+    void join(Lam* lam);
+    /// H_p: are all splits relevant for p uniform?
+    bool is_homogeneous(const Def* p) const;
+    bool receives_varying(const Def* p, size_t i, size_t n) const;
     void pin_tvar(Lam* lam, size_t i);
 
     std::deque<ControlGraph> graphs_;

@@ -161,6 +161,71 @@ const Def* Divergence::rewrite_imm(const Def* def) {
     if (std::ranges::any_of(def->ops(), [&](const Def* op) { return is_varying(op); })) pin(def);
     return res;
 }
+
+const Def* Divergence::rewrite_imm_App(const App* app) {
+    auto res = mim::Analysis::rewrite_imm_App(app);
+
+    if (auto dispatch = Dispatch(app)) {
+        for (size_t i = 0, n = dispatch.num_targets(); i != n; ++i)
+            if (auto lam = isa_block(dispatch.target(i))) join(lam);
+    } else if (auto lam = isa_block(app->callee())) {
+        join(lam);
+    } else if (app->callee()->isa_mut<Lam>() && !Pi::isa_cn(app->callee()->type())) {
+        pin(app); // opaque call
+    }
+
+    return res;
+}
+
+// ==== join transformer ====
+
+bool Divergence::is_homogeneous(const Def* p) const {
+    auto it = node2graph_.find(p);
+    if (it == node2graph_.end()) return true;
+    if (auto i = it->second->sync_deps.find(p); i != it->second->sync_deps.end())
+        return std::ranges::none_of(i->second, [&](const Def* b) { return is_varying(b); });
+    return true;
+}
+
+bool Divergence::receives_varying(const Def* p, size_t i, size_t n) const {
+    auto& g = *node2graph_.at(p);
+    if (g.opaque_conts.contains(p)) return true;
+    if (auto args = g.incoming.find(p); args != g.incoming.end())
+        for (auto arg : args->second)
+            if (is_varying(arg->proj(n, i))) return true;
+    return false;
+}
+
+void Divergence::join(Lam* p) {
+    auto it = node2graph_.find(p);
+    if (it == node2graph_.end() || it->second->cyclic) return; // skip cyclic
+
+    auto& g  = *it->second;
+    bool hom = is_homogeneous(p);
+    auto n   = p->num_tvars();
+
+    for (size_t i = 0; i != n; ++i) {
+        if (is_varying(p->tvar(i))) continue;
+        if (receives_varying(p, i, n)) { // edge effect: a varying value flows in
+            pin_tvar(p, i);
+            continue;
+        }
+        if (hom) continue; // all relevant splits are uniform
+
+        // Definate Reaching: if every edge passes the very same Def and p does not nest it, that Def definitely
+        // reaches p. Then local inhomogeneity at p does not matter: all threads agree on it anyway.
+        const Def* def = nullptr;
+        bool same      = true;
+        if (auto args = g.incoming.find(p); args != g.incoming.end())
+            for (auto arg : args->second) {
+                auto a = arg->proj(n, i);
+                if (!def) def = a;
+                same &= a == def;
+            }
+
+        if (!same || !def || p->nests(def)) pin_tvar(p, i);
+    }
+}
 // dumps
 //
 
