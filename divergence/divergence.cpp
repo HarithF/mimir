@@ -115,6 +115,32 @@ void Divergence::build(ControlGraph& g) {
         if (auto lam = isa_block(n); lam && g.opaque_conts.contains(n))
             for (size_t i = 0, e = lam->num_tvars(); i != e; ++i)
                 pin_tvar(lam, i);
+
+    // TODO: cycles - run it on the head-rewired graph instead.
+    if (g.cyclic) return;
+
+    for (auto n : g.topo)
+        if (auto s = isa_block(n); s && split2sources.contains(s)) label_disjoint(g, s, split2sources[s]);
+}
+
+/// Algorithm 1: labels every node reachable from @p sources with the earliest node `p*` that lies on
+/// all paths from @p sources to it.
+/// A node that ends up labeled with itself is the end of two disjoint paths - i.e., @p split is relevant for it.
+
+void Divergence::label_disjoint(ControlGraph& g, Lam* split, const DefVec& sources) {
+    DefMap<const Def*> label;
+    for (auto p : g.topo) {
+        DefVec in;
+        if (contains(sources, p)) in.emplace_back(p);
+        if (auto i = g.preds.find(p); i != g.preds.end())
+            for (auto q : i->second)
+                if (auto l = label.find(q); l != label.end()) in.emplace_back(l->second);
+
+        if (in.empty()) continue; // not reachable from sources
+        bool same = std::ranges::all_of(in, [&](const Def* l) { return l == in.front(); });
+        label[p]  = same ? in.front() : p;
+        if (!same) g.sync_deps[p].emplace_back(g.splits[split]);
+    }
 }
 
 void Divergence::pin_tvar(Lam* lam, size_t i) {
@@ -153,12 +179,18 @@ void Divergence::dump(std::ostream& os) {
             std::print(os, ")");
             if (auto i = g.splits.find(lam); i != g.splits.end())
                 std::print(os, "   split on {}: {}", i->second->unique_name(), fact(i->second));
+            if (auto i = g.sync_deps.find(lam); i != g.sync_deps.end()) {
+                std::print(os, "   splits:");
+                for (auto b : i->second)
+                    std::print(os, " {}", b->unique_name());
+            }
             std::println(os);
         }
     }
 }
 
 void Divergence::dump_control(std::ostream& os) {
+    std::println(os, "ControlGraph: ");
     for (const auto& g : graphs_) {
         std::println(os, "{}:", g.root->unique_name());
         for (auto n : g.topo) {

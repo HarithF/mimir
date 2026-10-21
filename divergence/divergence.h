@@ -52,9 +52,9 @@ private:
     const Def* rewrite_imm(const Def*) final;
 
     void build(ControlGraph&);
+    // records @p split in ControlGraph::sync_deps of every node where two disjoint paths meet.
+    void label_disjoint(ControlGraph&, Lam* split, const DefVec& sources);
 
-    /// Uniformity of the i-th incoming argument of node @p p.
-    bool is_varying_targ(const Def* p, size_t i, size_t n) const;
     void pin_tvar(Lam* lam, size_t i);
 
     std::deque<ControlGraph> graphs_;
