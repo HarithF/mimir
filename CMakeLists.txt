@@ -88,6 +88,7 @@ add_subdirectory(src)
 
 if(MIM_BUILD_EXAMPLES)
     add_subdirectory(examples)
+    add_subdirectory(divergence)
 endif()
 
 if(MIM_BUILD_DOCS)
