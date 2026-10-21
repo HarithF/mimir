@@ -1,0 +1,143 @@
+#include "divergence.h"
+
+#include <print>
+
+#include <mim/driver.h>
+#include <mim/lam.h>
+#include <mim/tuple.h>
+#include <mim/world.h>
+
+namespace mim {
+
+namespace {
+
+Lam* isa_block(const Def* def) {
+    if (auto lam = Lam::isa_mut_basicblock(def); lam && lam->is_set()) return lam;
+    return nullptr;
+}
+
+/// return continuation of a function
+bool isa_exit(const Def* def) { return !def->isa_mut() && Pi::isa_basicblock(def->type()); }
+
+bool isa_node(const Def* def) { return isa_block(def) || isa_exit(def); }
+
+bool contains(const DefVec& v, const Def* def) { return std::ranges::find(v, def) != v.end(); }
+
+} // namespace
+
+void Divergence::run_to_fp() {
+    auto max_iters = driver().flags().max_fp_iters;
+    uint32_t i     = 0;
+    while (true) {
+        if (i >= max_iters) error("phase `{}` did not reach a fixed point after {} iterations", name(), max_iters);
+        reset();
+        run();
+        if (!todo()) break;
+        i++;
+    }
+}
+
+// ==== jump graph ====
+
+void Divergence::prepare() {
+    if (!graphs_.empty()) return; // the jump graph is build it once
+
+    for (auto mut : world().externals().muts())
+        if (auto lam = mut->isa_mut<Lam>(); lam && lam->is_set()) {
+            auto& graph = graphs_.emplace_back();
+            graph.root  = lam;
+            build(graph);
+        }
+}
+
+void Divergence::build(ControlGraph& g) {
+    DefMap<nodeStates> state;
+    DefVec post;
+    LamMap<DefVec> split2sources;
+
+    auto add_edge = [&](Lam* q, const Def* p, const Def* arg, DefVec& succs) {
+        g.succs[q].emplace_back(p);
+        g.preds[p].emplace_back(q);
+        if (arg) g.incoming[p].emplace_back(arg);
+        succs.emplace_back(p);
+    };
+
+    auto succs_of = [&](Lam* q) {
+        DefVec succs;
+        auto app = q->body()->isa<App>();
+        if (!app) return succs;
+
+        auto dispatch = Dispatch(app);
+        auto targets  = dispatch ? dispatch.tuple()->projs(dispatch.num_targets()) : DefVec();
+        if (dispatch && std::ranges::all_of(targets, isa_node)) {
+            DefVec sources;
+            for (size_t i = 0, n = dispatch.num_targets(); i != n; ++i)
+                if (auto t = dispatch.target(i); !contains(sources, t)) {
+                    sources.emplace_back(t);
+                    add_edge(q, t, dispatch.arg(), succs);
+                }
+            if (sources.size() > 1) {
+                g.splits[q]      = dispatch.index();
+                split2sources[q] = std::move(sources);
+            }
+        } else if (isa_node(app->callee())) {
+            add_edge(q, app->callee(), app->arg(), succs); // plain jump
+        } else {
+            // Opaque call
+            for (auto arg : app->args())
+                if (isa_node(arg)) {
+                    g.opaque_conts.emplace(arg);
+                    add_edge(q, arg, nullptr, succs);
+                }
+        }
+        return succs;
+    };
+
+    // record the graph, its post order, and whether it contains a cycle.
+    auto dfs = [&](this auto&& self, const Def* n) -> void {
+        state[n]       = Active;
+        node2graph_[n] = &g;
+        if (auto q = isa_block(n); q || n == g.root) {
+            for (auto s : succs_of(q ? q : g.root))
+                if (auto i = state.find(s); i == state.end())
+                    self(s);
+                else if (i->second == Active)
+                    g.cyclic = true;
+        }
+        state[n] = Done;
+        post.emplace_back(n);
+    };
+    dfs(g.root);
+    g.topo.assign(post.rbegin(), post.rend());
+}
+
+const Def* Divergence::rewrite_imm(const Def* def) {
+    auto res = mim::Analysis::rewrite_imm(def);
+
+    // Lam::tvar%s carry their own facts
+    if (auto extract = def->isa<Extract>(); extract && extract->tuple()->isa<Var>() && Lit::isa(extract->index()))
+        return res;
+
+    if (auto app = def->isa<App>(); app && Pi::isa_cn(app->callee()->type())) return res;
+
+    if (std::ranges::any_of(def->ops(), [&](const Def* op) { return is_varying(op); })) pin(def);
+    return res;
+}
+// dumps
+//
+
+void Divergence::dump(std::ostream& os) {
+    for (const auto& g : graphs_) {
+        std::println(os, "{}:", g.root->unique_name());
+        for (auto n : g.topo) {
+            std::print(os, "    {} ->", n->unique_name());
+            if (auto i = g.succs.find(n); i != g.succs.end())
+                for (auto s : i->second)
+                    std::print(os, " {}", s->unique_name());
+            if (auto lam = n->isa_mut<Lam>(); lam && g.splits.contains(lam))
+                std::print(os, "   [split on {}]", g.splits.at(lam)->unique_name());
+            std::println(os);
+        }
+    }
+}
+} // namespace mim
