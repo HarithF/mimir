@@ -4,8 +4,7 @@ namespace mim::plug::math {
 
 namespace {
 
-template<class F>
-std::optional<u64> dispatch_float_width(nat_t width, F&& f) {
+std::optional<u64> dispatch_float_width(nat_t width, auto f) {
     switch (width) {
 #define CODE(i) \
     case i: return f.template operator()<i>();
@@ -15,8 +14,7 @@ std::optional<u64> dispatch_float_width(nat_t width, F&& f) {
     }
 }
 
-template<class F>
-std::optional<u64> dispatch_int_width(nat_t width, F&& f) {
+std::optional<u64> dispatch_int_width(nat_t width, auto f) {
     switch (width) {
 #define CODE(i) \
     case i: return f.template operator()<i>();
@@ -26,19 +24,19 @@ std::optional<u64> dispatch_int_width(nat_t width, F&& f) {
     }
 }
 
-template<nat_t w, class F>
-std::optional<u64> fold_float_unary_bits(u64 a, F&& f) {
+template<nat_t w>
+std::optional<u64> fold_float_unary_bits(u64 a, std::invocable<w2f<w>> auto f) {
     using T = w2f<w>;
-    auto x  = bitcast_resize<T>(a);
-    return bitcast_resize<u64>(static_cast<T>(f(x)));
+    auto x  = fe::bitcast_resize<T>(a);
+    return fe::bitcast_resize<u64>(static_cast<T>(f(x)));
 }
 
-template<nat_t w, class F>
-std::optional<u64> fold_float_binary_bits(u64 a, u64 b, F&& f) {
+template<nat_t w>
+std::optional<u64> fold_float_binary_bits(u64 a, u64 b, std::invocable<w2f<w>, w2f<w>> auto f) {
     using T = w2f<w>;
-    auto x  = bitcast_resize<T>(a);
-    auto y  = bitcast_resize<T>(b);
-    return bitcast_resize<u64>(static_cast<T>(f(x, y)));
+    auto x  = fe::bitcast_resize<T>(a);
+    auto y  = fe::bitcast_resize<T>(b);
+    return fe::bitcast_resize<u64>(static_cast<T>(f(x, y)));
 }
 
 template<nat_t w>
@@ -69,43 +67,43 @@ std::optional<u64> encode_signed(long double x) {
         if (x == 0.0L) return 0_u64;
         return {};
     } else {
-        return bitcast_resize<u64>(static_cast<w2s<w>>(x));
+        return fe::bitcast_resize<u64>(static_cast<w2s<w>>(x));
     }
 }
 
 template<nat_t w>
 std::optional<u64> encode_unsigned(long double x) {
-    return bitcast_resize<u64>(static_cast<w2u<w>>(x));
+    return fe::bitcast_resize<u64>(static_cast<w2u<w>>(x));
 }
 
 template<nat_t w>
 long double decode_signed(u64 a) {
     if constexpr (w == 1)
-        return bitcast_resize<bool>(a) ? -1.0L : 0.0L;
+        return fe::bitcast_resize<bool>(a) ? -1.0L : 0.0L;
     else
-        return static_cast<long double>(bitcast_resize<w2s<w>>(a));
+        return static_cast<long double>(fe::bitcast_resize<w2s<w>>(a));
 }
 
 template<nat_t w>
 long double decode_unsigned(u64 a) {
-    return static_cast<long double>(bitcast_resize<w2u<w>>(a));
+    return static_cast<long double>(fe::bitcast_resize<w2u<w>>(a));
 }
 
-template<nat_t w, class F>
-std::optional<u64> fold_float_to_signed_bits(F x) {
+template<nat_t w>
+std::optional<u64> fold_float_to_signed_bits(std::floating_point auto x) {
     if (!std::isfinite(x)) return {};
 
     auto truncated = std::trunc(static_cast<long double>(x));
-    if (truncated < signed_min<w>() || truncated > signed_max<w>()) return {};
+    if (truncated < signed_min<w>() || truncated >= -signed_min<w>()) return {};
     return encode_signed<w>(truncated);
 }
 
-template<nat_t w, class F>
-std::optional<u64> fold_float_to_unsigned_bits(F x) {
+template<nat_t w>
+std::optional<u64> fold_float_to_unsigned_bits(std::floating_point auto x) {
     if (!std::isfinite(x)) return {};
 
     auto truncated = std::trunc(static_cast<long double>(x));
-    if (truncated < 0.0L || truncated > unsigned_max<w>()) return {};
+    if (truncated < 0.0L || truncated >= unsigned_max<w>() + 1.0L) return {};
     return encode_unsigned<w>(truncated);
 }
 
@@ -126,7 +124,7 @@ std::optional<u64> fold_unary_lit(u64 a) {
         else if constexpr (id == tri::asinh) return fold_float_unary_bits<w>(a, [](auto x) { return std::asinh(x); });
         else if constexpr (id == tri::acosh) return fold_float_unary_bits<w>(a, [](auto x) { return std::acosh(x); });
         else if constexpr (id == tri::atanh) return fold_float_unary_bits<w>(a, [](auto x) { return std::atanh(x); });
-        else fe::unreachable();
+        else std::unreachable();
     } else if constexpr (std::is_same_v<Id, rt>) {
         if constexpr (false) {}
         else if constexpr (id == rt::sq) return fold_float_unary_bits<w>(a, [](auto x) { return std::sqrt(x); });
@@ -140,7 +138,7 @@ std::optional<u64> fold_unary_lit(u64 a) {
         else if constexpr (id == exp::log)   return fold_float_unary_bits<w>(a, [](auto x) { return std::log(x); });
         else if constexpr (id == exp::log2)  return fold_float_unary_bits<w>(a, [](auto x) { return std::log2(x); });
         else if constexpr (id == exp::log10) return fold_float_unary_bits<w>(a, [](auto x) { return std::log10(x); });
-        else fe::unreachable();
+        else std::unreachable();
     } else if constexpr (std::is_same_v<Id, er>) {
         if constexpr (false) {}
         else if constexpr (id == er::f ) return fold_float_unary_bits<w>(a, [](auto x) { return std::erf (x); });
@@ -187,26 +185,25 @@ const Def* fold(World& world, const Def* type, const Def* a) {
 template<class Id, Id id, nat_t w>
 std::optional<u64> fold_binary_lit(u64 a, u64 b) {
     using T = w2f<w>;
-    auto x  = bitcast_resize<T>(a);
-    auto y  = bitcast_resize<T>(b);
+    auto x  = fe::bitcast_resize<T>(a);
+    auto y  = fe::bitcast_resize<T>(b);
 
     if constexpr (std::is_same_v<Id, arith>) {
         // clang-format off
         if constexpr (false) {}
-        else if constexpr (id == arith::add) return bitcast_resize<u64>(static_cast<T>(x + y));
-        else if constexpr (id == arith::sub) return bitcast_resize<u64>(static_cast<T>(x - y));
-        else if constexpr (id == arith::mul) return bitcast_resize<u64>(static_cast<T>(x * y));
-        else if constexpr (id == arith::div) return bitcast_resize<u64>(static_cast<T>(x / y));
-        else if constexpr (id == arith::rem) return bitcast_resize<u64>(static_cast<T>(rem(x, y)));
+        else if constexpr (id == arith::add) return fe::bitcast_resize<u64>(static_cast<T>(x + y));
+        else if constexpr (id == arith::sub) return fe::bitcast_resize<u64>(static_cast<T>(x - y));
+        else if constexpr (id == arith::mul) return fe::bitcast_resize<u64>(static_cast<T>(x * y));
+        else if constexpr (id == arith::div) return fe::bitcast_resize<u64>(static_cast<T>(x / y));
+        else if constexpr (id == arith::rem) return fe::bitcast_resize<u64>(static_cast<T>(rem(x, y)));
         else static_assert(false, "missing sub tag");
         // clang-format on
     } else if constexpr (std::is_same_v<Id, math::extrema>) {
         T result;
 
-        if (x == T(-0.0) && y == T(+0.0)) {
-            result = (id == extrema::fmin || id == extrema::ieee754min) ? x : y;
-        } else if (x == T(+0.0) && y == T(-0.0)) {
-            result = (id == extrema::fmin || id == extrema::ieee754min) ? y : x;
+        if (x == T(0) && y == T(0) && std::signbit(x) != std::signbit(y)) {
+            bool min = id == extrema::fmin || id == extrema::ieee754min;
+            result   = min == std::signbit(x) ? x : y;
         } else if constexpr (id == extrema::fmin || id == extrema::fmax) {
             result = id == extrema::fmin ? std::fmin(x, y) : std::fmax(x, y);
         } else if constexpr (id == extrema::ieee754min || id == extrema::ieee754max) {
@@ -220,9 +217,9 @@ std::optional<u64> fold_binary_lit(u64 a, u64 b) {
             static_assert(false, "missing sub tag");
         }
 
-        return bitcast_resize<u64>(result);
+        return fe::bitcast_resize<u64>(result);
     } else if constexpr (std::is_same_v<Id, pow>) {
-        return bitcast_resize<u64>(static_cast<T>(std::pow(x, y)));
+        return fe::bitcast_resize<u64>(static_cast<T>(std::pow(x, y)));
     } else if constexpr (std::is_same_v<Id, cmp>) {
         using std::isunordered;
         bool result = false;
@@ -290,7 +287,7 @@ const Def* reassociate(Id id, World& world, [[maybe_unused]] const App* ab, cons
     // build mode for all new ops by using the least upper bound of all involved apps
     auto mode       = std::to_underlying(Mode::bot);
     auto check_mode = [&](const App* app) {
-        auto app_m = Lit::isa(app->arg(0));
+        auto app_m = Lit::isa(app->decurry()->arg());
         if (!app_m || !fe::has_flag(static_cast<Mode>(*app_m), Mode::reassoc)) return false;
         mode &= *app_m; // least upper bound
         return true;
@@ -315,11 +312,11 @@ std::optional<u64> fold_conv_lit(u64 a) {
     using D = w2f<dw>;
     // clang-format off
     if constexpr (false) {}
-    else if constexpr (id == conv::s2f) return bitcast_resize<u64>(static_cast<D>(decode_signed<sw>(a)));
-    else if constexpr (id == conv::u2f) return bitcast_resize<u64>(static_cast<D>(decode_unsigned<sw>(a)));
-    else if constexpr (id == conv::f2s) return fold_float_to_signed_bits<dw>(bitcast_resize<S>(a));
-    else if constexpr (id == conv::f2u) return fold_float_to_unsigned_bits<dw>(bitcast_resize<S>(a));
-    else if constexpr (id == conv::f2f) return bitcast_resize<u64>(static_cast<D>(bitcast_resize<S>(a)));
+    else if constexpr (id == conv::s2f) return fe::bitcast_resize<u64>(static_cast<D>(decode_signed<sw>(a)));
+    else if constexpr (id == conv::u2f) return fe::bitcast_resize<u64>(static_cast<D>(decode_unsigned<sw>(a)));
+    else if constexpr (id == conv::f2s) return fold_float_to_signed_bits<dw>(fe::bitcast_resize<S>(a));
+    else if constexpr (id == conv::f2u) return fold_float_to_unsigned_bits<dw>(fe::bitcast_resize<S>(a));
+    else if constexpr (id == conv::f2f) return fe::bitcast_resize<u64>(static_cast<D>(fe::bitcast_resize<S>(a)));
     else static_assert(false, "missing sub tag");
     // clang-format on
 }
@@ -347,7 +344,7 @@ const Def* normalize_arith(const Def* type, const Def* c, const Def* arg) {
     auto& world = type->world();
     auto callee = c->as<App>();
     auto [a, b] = arg->projs<2>();
-    auto mode   = callee->arg();
+    auto mode   = callee->decurry()->arg();
     auto lm     = Lit::isa(mode);
     auto w      = isa_f(a->type());
 
@@ -388,7 +385,7 @@ const Def* normalize_arith(const Def* type, const Def* c, const Def* arg) {
                     case arith::sub: return a;  // a - 0 -> a
                     case arith::div: break;
                     case arith::rem: break;
-                    default: fe::unreachable();
+                    default: std::unreachable();
                     // add, mul are commutative, the literal has been normalized to the left
                 }
             }
@@ -416,13 +413,12 @@ const Def* normalize_extrema(const Def* type, const Def* c, const Def* arg) {
     auto& world = type->world();
     auto callee = c->as<App>();
     auto [a, b] = arg->projs<2>();
-    auto m      = callee->arg();
+    auto m      = callee->decurry()->arg();
     auto lm     = Lit::isa(m);
-    // TODO commute
 
     if (auto lit = fold<extrema, id>(world, type, a, b)) return lit;
 
-    if (lm && (fe::has_flag(static_cast<Mode>(*lm), Mode::nnan) || fe::has_flag(static_cast<Mode>(*lm), Mode::nsz))) {
+    if (lm && fe::has_flag(static_cast<Mode>(*lm), Mode::nnan | Mode::nsz)) {
         switch (id) {
             case extrema::ieee754min: return world.call(extrema::fmin, m, Defs{a, b});
             case extrema::ieee754max: return world.call(extrema::fmax, m, Defs{a, b});
@@ -504,8 +500,13 @@ const Def* normalize_conv(const Def* dst_t, const Def*, const Def* x) {
     constexpr bool sf = id == conv::f2f || id == conv::f2s || id == conv::f2u;
     constexpr bool df = id == conv::f2f || id == conv::s2f || id == conv::u2f;
 
-    auto sw = sf ? isa_f(s_t) : (ls ? Idx::size2bitwidth(*ls) : std::optional<nat_t>());
-    auto dw = df ? isa_f(d_t) : (ld ? Idx::size2bitwidth(*ld) : std::optional<nat_t>());
+    // Only a power-of-two Idx is an integer of its bitwidth.
+    auto int_w = [](std::optional<nat_t> l) -> std::optional<nat_t> {
+        if (l && (*l == 0 || std::has_single_bit(*l))) return Idx::size2bitwidth(*l);
+        return {};
+    };
+    auto sw = sf ? isa_f(s_t) : int_w(ls);
+    auto dw = df ? isa_f(d_t) : int_w(ld);
 
     if (auto l = Lit::isa(x); l && sw && dw)
         if (auto res = fold_conv<id>(*sw, *dw, *l)) return world.lit(d_t, *res);

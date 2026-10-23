@@ -1,11 +1,12 @@
 #pragma once
 
-#include <absl/container/btree_set.h>
+#include <fe/worklist.h>
 
 #include <mim/def.h>
 #include <mim/phase.h>
+#include <mim/tuple.h>
 
-#include <mim/util/util.h>
+#include <mim/util/gid.h>
 
 namespace mim::plug::mem::phase {
 
@@ -15,6 +16,7 @@ namespace mim::plug::mem::phase {
 /// * propagates whole expressions - not just constants
 /// * optimistically combines φs/Vars that are already present with those being constructed through SSA translation
 /// * since abstract domain is a MimIR expression, stack slots themselves can be propagated etc.
+/// * contifies for free: a continuation parameter that all call sites agree on is propagated away
 ///
 /// Additional papers worth reading:
 /// * [Constant propagation with conditional branches](https://dl.acm.org/doi/pdf/10.1145/103135.103136)
@@ -22,6 +24,7 @@ namespace mim::plug::mem::phase {
 /// * [Combining analyses, combining optimizations](https://dl.acm.org/doi/pdf/10.1145/201059.201061)
 /// * [Simple and efficient construction of static single assignment
 /// form](https://dl.acm.org/doi/10.1007/978-3-642-37051-9_6)
+/// * [Contification using dominators](https://dl.acm.org/doi/10.1145/507635.507639)
 ///
 /// Due to MimIR's sea of node structure a number of other optimizations kick in such as arithmetic simplifications and
 /// code motion.
@@ -54,44 +57,63 @@ private:
 
         // SSA
         const auto& slots() const { return slots_; }
-        const auto& lam2sloxy2val() const { return lam2sloxy2val_; }
         const Def* lam2sloxy2val(Lam* lam, const Def* sloxy);
+        /// Can *every* recorded call site of @p lam supply a value for @p sloxy?
+        /// Only then may build_args() find an argument for a phi threaded through @p lam.
+        bool can_supply(Lam* lam, const Def* sloxy);
 
     private:
         // SCCP
         const Proxy* mk_sccp_top(const Def* var);
         const Def* sccp_join(Lam*, const Def*, const Def*);
-        DefVec sccp(Lam*, Defs vars, Defs abstr_args);
 
         /// Applies @p known to @p abstr_targs (one per tvar): propagates phis, runs SCCP + GVN, and sets the vars.
         const Def* apply_known(Lam* known, Defs abstr_targs);
+        /// An App that merely records "@p callee applied to these abstract args"; never emitted code.
+        const Def* abstract_app(const Def* callee, const Def* arg);
 
         // GVN
         const Proxy* mk_bundle(Lam* lam, const Def* var, Defs bundle_vars);
-        void gvn_bundle(Lam*, Defs, Defs, Span<const Def*>);
-        void gvn_split(Lam*, Defs, Span<const Def*>, Span<const Def*>);
+        void gvn_bundle(Lam*, Defs, Defs, fe::Span<const Def*>);
+        void gvn_split(Lam*, Defs, fe::Span<const Def*>, fe::Span<const Def*>);
 
         // SSA
+        /// Grows lam2live_ by closing @p lam's free Var%s and @p abstr_args over the lattice and slot2stored_.
+        void live(Lam* lam, Defs abstr_args);
+        using VarWorklist = fe::DFSWorklist<GIDSet<const Var*>>;
+        /// The slot Var%s reachable from @p todo through the lattice and slot2stored_.
+        Vars reachable_slots(VarWorklist& todo);
+        /// Like free_vars() but skips mem-typed parts, which cannot carry a slot's ptr.
+        Vars non_mem_free_vars(const Def* def);
+        /// A direct-style call may access every slot reachable from the non-mem parts of its abstract callee and arg.
+        void pin_reachable_slots(const Def* abstr_callee, const Def* abstr_arg);
+        void pin_slot(const App* slot);
+        /// Writes `concr ↦ abstr` resolved against @p sloxy, which pin_slot erases again.
+        void resolve(const Def* sloxy, const Def* concr, const Def* abstr);
         void propagate_phis(Lam*, DefVec& vars, DefVec& abstr_args);
         const Def* sloxy2val(const Def* sloxy) { return lam2sloxy2val(curr_mut<Lam>(), sloxy); }
         const Def* sloxy2val(const Def* sloxy, const Def* val) { return lam2sloxy2val_[curr_mut<Lam>()][sloxy] = val; }
-
         const Def* rewrite_imm_App(const App*) final;
+        void leave() final;
 
         // post-processing analysis to find sloxies that must be set to top
         void finalize() final;
         void analyze(const Def*);
 
         // local (reset between iterations)
-        absl::node_hash_map<Lam*, Def2Def, GIDHash<const Def*>> lam2sloxy2val_;
+        LamMap<Def2Def> lam2sloxy2val_;
         DefSet visited_;
         DefSet first_;
+        DefMap<Vars> non_mem_fvs_;
 
         // global (kept between iterations)
-        Def2Def sloxy2slot_;
-        absl::btree_set<const Def*, GIDLt<const Def*>> slots_; // actually slot ptrs
-        LamSet unknowns_;            // Lam%s reached as a *value*; their signature must stay untouched
-        LamMap<MutSet> lam2callers_; // all muts that apply a Lam; tainted when the Lam's abstract vars change
+        DefSet slots_;                 // actually slot ptrs
+        VarMap<const App*> var2slot_;  // slot continuation Var ↦ its slot
+        VarMap<Vars> slot2stored_;     // free Var%s of the values stored behind a slot
+        VarMap<DefSet> slot2resolved_; // promoted leas and loaded values whose lattice entry depends on the slot
+        LamMap<Vars> lam2live_;        // slot Var%s a Lam may access; only grows
+        LamSet unknowns_;              // Lam%s reached as a *value*; their signature must stay untouched
+        LamMap<MutSet> lam2callers_;   // all muts that apply a Lam; tainted when the Lam's abstract vars change
     };
 
 public:
@@ -101,31 +123,46 @@ public:
 
 private:
     const Def* rewrite_imm_App(const App*) final;
+    const Def* rewrite_imm_Var(const Var*) final;
     const Def* rewrite_mut_Lam(Lam*) final;
 
-    /// A live phi for @p old_lam: the @p sloxy it stands for, the @p phi proxy, and its abstract @p val.
+    /// A live phi for a Lam: the @p sloxy it stands for, the @p phi proxy, and its abstract @p val.
     struct Phi {
         const Def* sloxy;
         const Def* phi;
         const Def* val;
     };
 
-    /// Was the SSA construction able to eliminate this sloxy?
-    const Def* isa_optimized_sloxy(const Def*) const;
-    /// The (memoized) live phis of @p old_lam.
-    const Vector<Phi>& phis_of(Lam* old_lam);
-    /// Does @p old_lam have propagated vars or live phis and hence needs a new signature?
-    bool needs_seo(View<Phi>, Lam* old_lam);
+    /// The new signature of an old Lam: the old Lam's tvars sieved, with Sig::phis appended as further candidates.
+    /// So Sieve::num_new is the new Lam's arity, Sieve::operator[] the new index of an old tvar,
+    /// and Sieve::cat the new index of a phi.
+    struct Sig {
+        fe::Vector<Phi> phis; ///< Its live phis.
+        Sieve sieve{0};       ///< @see Sig
+        bool todo = false;    ///< Does the old Lam need a new signature at all?
+    };
+
+    bool analyze() final;
+
+    /// Does @p old_ptr point (via literal mem.lea%s) into a promoted slot? Then yields its sloxy.
+    const Def* isa_promoted(const Def* old_ptr) const;
+    /// The (memoized) new signature of @p old_lam.
+    const Sig& sig_of(Lam* old_lam);
+    /// The new spelling of @p old_lam's var: kept projections become new vars, dropped ones their
+    /// propagated value (⊥ for a promoted slot). The single source of truth for both build_lam() and
+    /// rewrite_imm_Var(), and hence well-defined independent of build order.
+    const Def* var_of(Lam* old_lam);
     /// Builds (and caches) the new Lam for @p old_lam with propagated vars removed and kept phis appended.
-    Lam* build_lam(View<Phi>, Lam* old_lam);
+    Lam* build_lam(Lam* old_lam);
     /// Builds the argument list for a jump to @p old_lam (with the given @p old_targs, one per tvar)
     /// matching the signature built by build_lam().
-    DefVec build_args(View<Phi>, Lam* old_lam, Defs old_targs);
+    DefVec build_args(Lam* old_lam, Defs old_targs);
 
     Analysis analysis_;
     Lam2Lam lam_old2new_;
     Lam2Lam lam_new2old_;
-    absl::node_hash_map<Lam*, Vector<Phi>, GIDHash<Lam*>> lam2phis_;
+    GIDNodeMap<Lam*, Sig> lam2sig_; // a Sig& outlives nested rewrites
+    DefVec sloxies_;                // the eliminated sloxies; every Lam's phi candidates
 };
 
 } // namespace mim::plug::mem::phase

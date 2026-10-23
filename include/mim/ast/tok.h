@@ -1,5 +1,9 @@
 #pragma once
 
+#include <optional>
+#include <string_view>
+#include <utility>
+
 #include <fe/assert.h>
 #include <fe/format.h>
 
@@ -8,24 +12,33 @@
 namespace mim {
 
 class Def;
-class Lit;
 
 namespace ast {
 
 /// @name Precedence Table
-/// X-macro listing all expression precedences from lowest to highest.
-/// Each entry is `m(name, assoc)` where @p assoc is `L`, `R`, or `N`.
+/// X-macro listing all expression precedences from lowest to highest as `m(name, assoc)`.
+/// @p assoc is `L`eft-, `R`ight-, or `N`on-associative; `a op b op c` is an error for an `N` level.
+/// Only a level named by MIM_PREFIX, MIM_INFIX, or by an entry below is an actual operator:
+/// `Err`, `Bot`, `Pi`, and `Lit` merely serve as a `curr_prec` bound while parsing.
+/// Application binds tighter than every operator - only `Extract` and `Lit` bind tighter still.
 ///@{
 // clang-format off
 #define MIM_PREC(m)     \
     m(Err,     N)       \
     m(Bot,     N)       \
     m(Where,   L)       \
+    m(Ins,     R)       \
+    m(Inj,     R)       \
+    m(Union,   L)       \
     m(Arrow,   R)       \
     m(Pi,      N)       \
-    m(Inj,     R)       \
+    m(Eq,      N)       \
+    m(Rel,     N)       \
+    m(Add,     L)       \
+    m(Mul,     L)       \
+    m(Shift,   L)       \
+    m(Prefix,  N)       \
     m(App,     L)       \
-    m(Union,   L)       \
     m(Extract, L)       \
     m(Lit,     N)
 // clang-format on
@@ -49,11 +62,10 @@ constexpr Assoc prec_assoc(Prec p) {
         MIM_PREC(CODE)
 #undef CODE
     }
-    fe::unreachable();
+    std::unreachable();
 }
 
 constexpr bool is_rassoc(Prec p) { return prec_assoc(p) == Assoc::R; }
-constexpr bool is_lassoc(Prec p) { return prec_assoc(p) == Assoc::L; }
 
 /// Should a Pratt parser reduce when the current binding power is @p curr
 /// and the infix operator has precedence @p op?
@@ -72,12 +84,10 @@ constexpr bool should_reduce(Prec curr, Prec op) { return is_rassoc(op) ? curr >
     m(K_Idx,    "Idx"   )             \
     m(K_Nat,    "Nat"   )             \
     m(K_Type,   "Type"  )             \
-    m(K_Univ,   "Univ"  )             \
-    m(K_and,    "and"   )             \
+    m(K_Level,  "Level" )             \
+    m(K_anx,    "anx"   )             \
     m(K_as,     "as"    )             \
     m(K_axm,    "axm"   )             \
-    m(K_ccon,   "ccon"  )             \
-    m(K_cfun,   "cfun"  )             \
     m(K_cn,     "cn"    )             \
     m(K_con,    "con"   )             \
     m(K_end,    "end"   )             \
@@ -92,18 +102,22 @@ constexpr bool should_reduce(Prec curr, Prec op) { return is_rassoc(op) ? curr >
     m(K_i8,     "i8"    )             \
     m(K_import, "import")             \
     m(K_inj,    "inj"   )             \
-    m(K_ins,    "ins"   )             \
     m(K_lam,    "lam"   )             \
     m(K_let,    "let"   )             \
     m(K_match,  "match" )             \
-    m(K_module, "module")             \
+    m(K_mod,    "mod"   )             \
+    m(K_mutual, "mutual")             \
+    m(K_nom,    "nom"   )             \
     m(K_norm,   "norm"  )             \
     m(K_plugin, "plugin")             \
+    m(K_priv,   "priv"  )             \
+    m(K_pub,    "pub"   )             \
     m(K_rec,    "rec"   )             \
     m(K_ret,    "ret"   )             \
     m(K_rule,   "rule"  )             \
     m(K_Rule,   "Rule"  )             \
     m(K_tt,     "tt"    )             \
+    m(K_use,    "use"   )             \
     m(K_when,   "when"  )             \
     m(K_where,  "where" )             \
     m(K_with,   "with"  )             \
@@ -123,7 +137,6 @@ constexpr auto Num_Keys = size_t(0) MIM_KEY(CODE);
     m(L_str,  "<string literal>"     ) \
     /* misc */                         \
     m(M_id,   "<identifier>"  )        \
-    m(M_anx,  "<annex name>"  )        \
     /* delimiters */                   \
     m(D_angle_l,    "‹")               \
     m(D_angle_r,    "›")               \
@@ -131,14 +144,13 @@ constexpr auto Num_Keys = size_t(0) MIM_KEY(CODE);
     m(D_brace_r,    "}")               \
     m(D_brckt_l,    "[")               \
     m(D_brckt_r,    "]")               \
-    m(D_curly_l,    "⦃")               \
-    m(D_curly_r,    "⦄")               \
     m(D_paren_l,    "(")               \
     m(D_paren_r,    ")")               \
     m(D_quote_l,    "«")               \
     m(D_quote_r,    "»")               \
     /* further tokens */               \
-    m(T_arrow,      "→")               \
+    m(T_add,        "+")               \
+    m(T_arrow_r,      "→")               \
     m(T_fat_arrow, "=>")               \
     m(T_assign,     "=")               \
     m(T_at,         "@")               \
@@ -147,20 +159,77 @@ constexpr auto Num_Keys = size_t(0) MIM_KEY(CODE);
     m(T_box,        "□")               \
     m(T_colon,      ":")               \
     m(T_comma,      ",")               \
+    m(T_div,        "/")               \
     m(T_dollar,     "$")               \
     m(T_dot,        ".")               \
+    m(T_eq,         "==")              \
     m(T_extract,    "#")               \
+    m(T_ge,         ">=")              \
+    m(T_gt,         ">")               \
+    m(T_arrow_l,    "←")               \
+    m(T_le,         "<=")              \
     m(T_lm,         "λ")               \
+    m(T_lt,         "<")               \
+    m(T_ne,         "!=")              \
+    m(T_rem,        "%")               \
     m(T_semicolon,  ";")               \
+    m(T_shl,        "<<")              \
+    m(T_shr,        ">>")              \
     m(T_star,       "*")               \
+    m(T_sub,        "-")               \
     m(T_union,      "∪")               \
     m(T_pipe,       "|")               \
+
+/// @name Prefix Operator Table
+/// X-macro listing all prefix operators as `m(tag, str)`; they all live at Prec::Prefix.
+/// PrefixExpr::emit_ dispatches on the tag.
+///@{
+
+/// `#` is a prefix operator *and* an infix one; which one it is depends on the position it occurs in.
+#define MIM_PREFIX(m)         \
+    m(T_extract,  "#")
+///@}
+
+/// @name Infix Operator Table
+/// X-macros listing all infix operators as `m(tag, str, prec)`.
+///@{
+
+/// `a str b` is sugar for `` `str (a, b) ``; what `` `str `` means is up to whatever the user binds it to.
+#define MIM_INFIX_SUGAR(m)  \
+    m(T_eq,   "==", Eq   )  \
+    m(T_ne,   "!=", Eq   )  \
+    m(T_lt,   "<",  Rel  )  \
+    m(T_le,   "<=", Rel  )  \
+    m(T_gt,   ">",  Rel  )  \
+    m(T_ge,   ">=", Rel  )  \
+    m(T_shl,  "<<", Shift)  \
+    m(T_shr,  ">>", Shift)  \
+    m(T_add,  "+",  Add  )  \
+    m(T_sub,  "-",  Add  )  \
+    m(T_star, "*",  Mul  )  \
+    m(T_div,  "/",  Mul  )  \
+    m(T_rem,  "%",  Mul  )
+
+/// These have a meaning of their own; InfixExpr::emit_ dispatches on the tag.
+#define MIM_INFIX_CORE(m)         \
+    m(T_extract,  "#",   Extract) \
+    m(T_union,    "∪",   Union  ) \
+    m(K_inj,      "inj", Inj    ) \
+    m(T_arrow_r,  "→",   Arrow  ) \
+    m(T_arrow_l,  "←",   Ins    ) \
+    m(T_at,       "@",   App    )
+
+#define MIM_INFIX(m) MIM_INFIX_SUGAR(m) MIM_INFIX_CORE(m)
+///@}
 
 #define MIM_SUBST(m)                  \
     m("lm",     T_lm   )              \
     m("bot",    T_bot  )              \
     m("top",    T_top  )              \
-    m("insert", K_ins  )              \
+
+#define CODE(str, t) + size_t(1)
+constexpr auto Num_Subst = size_t(0) MIM_SUBST(CODE);
+#undef CODE
 
 class Tok {
 public:
@@ -174,7 +243,52 @@ public:
     };
 
     static const char* tag2str(Tok::Tag);
+    /// Is @p tag something the keyword table yields? MIM_KEY occupies `[1, Num_Keys]`; MIM_SUBST adds a few more.
+    static constexpr bool is_key(Tag tag) {
+        if (tag == Tag::Nil) return false;
+        if (size_t(tag) <= Num_Keys) return true;
+        switch (tag) {
+#define CODE(str, t) case Tag::t:
+            MIM_SUBST(CODE)
+#undef CODE
+            return true;
+            default: return false;
+        }
+    }
+    /// Is @p tag a prefix operator? @see MIM_PREFIX.
+    static constexpr bool is_prefix(Tag tag) {
+        switch (tag) {
+#define CODE(t, str) case Tag::t:
+            MIM_PREFIX(CODE)
+#undef CODE
+            return true;
+            default: return false;
+        }
+    }
+    /// Precedence of the infix operator @p tag; `std::nullopt` if @p tag isn't one.
+    static constexpr std::optional<Prec> infix_prec(Tag tag) {
+        switch (tag) {
+#define CODE(t, str, prec) \
+    case Tag::t: return Prec::prec;
+            MIM_INFIX(CODE)
+#undef CODE
+            default: return {};
+        }
+    }
+    /// Name the infix operator @p tag desugars to - including the leading `` ` ``; empty for MIM_INFIX_CORE.
+    static constexpr std::string_view infix_sym(Tag tag) {
+        switch (tag) {
+#define CODE(t, str, prec) \
+    case Tag::t: return "`" str;
+            MIM_INFIX_SUGAR(CODE)
+#undef CODE
+            default: return {};
+        }
+    }
     static constexpr Tok::Tag delim_l2r(Tag tag) { return Tok::Tag(int(tag) + 1); }
+    static constexpr bool is_delim_r(Tag tag) {
+        return Tag::D_angle_l <= tag && tag <= Tag::D_quote_r && (int(tag) - int(Tag::D_angle_l)) % 2 == 1;
+    }
     ///@}
 
     // clang-format on
@@ -199,27 +313,30 @@ public:
         : loc_(loc)
         , tag_(Tag::L_f)
         , u_(std::bit_cast<uint64_t>(d)) {}
-    Tok(Loc loc, const Lit* i)
+    /// @p size and @p val of an Idx literal; World::lit_idx makes a Lit of it at emit time.
+    Tok(Loc loc, uint64_t size, uint64_t val)
         : loc_(loc)
         , tag_(Tag::L_i)
-        , i_(i) {}
+        , idx_{size, val} {}
     Tok(Loc loc, Tag tag, Sym sym)
         : loc_(loc)
         , tag_(tag)
         , sym_(sym) {
-        assert(tag == Tag::M_id || tag == Tag::M_anx || tag == Tag::L_str);
+        assert(has_sym() || is_key(tag));
     }
 
     bool isa(Tag tag) const { return tag == tag_; }
     Tag tag() const { return tag_; }
-    Dbg dbg() const { return {loc(), sym()}; }
+    bool has_sym() const { return isa(Tag::M_id) || isa(Tag::L_str); }
+    /// @note A failed Parser::expect yields a Nil Tok; its Dbg is anonymous instead of asserting in Tok::sym.
+    Dbg dbg() const { return {loc(), has_sym() ? sym_ : Sym()}; }
     Loc loc() const { return loc_; }
     explicit operator bool() const { return tag_ != Tag::Nil; }
     // clang-format off
-    const Lit* lit_i() const { assert(isa(Tag::L_i)); return i_; }
+    std::pair<uint64_t, uint64_t> lit_i() const { assert(isa(Tag::L_i)); return {idx_.size, idx_.val}; }
     char8_t    lit_c() const { assert(isa(Tag::L_c)); return c_;   }
     uint64_t   lit_u() const { assert(isa(Tag::L_u ) || isa(Tag::L_s ) || isa(Tag::L_f  )); return u_;   }
-    Sym        sym()   const { assert(isa(Tag::M_anx) || isa(Tag::M_id) || isa(Tag::L_str)); return sym_; }
+    Sym        sym()   const { assert(has_sym()); return sym_; }
     // clang-format on
     std::string str() const;
 
@@ -230,10 +347,12 @@ private:
     Loc loc_;
     Tag tag_ = Tag::Nil;
     union {
-        Sym sym_;
+        Sym sym_ = {};
         uint64_t u_;
         char8_t c_;
-        const Lit* i_;
+        struct {
+            uint64_t size, val;
+        } idx_;
     };
 };
 

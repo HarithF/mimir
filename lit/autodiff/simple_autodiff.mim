@@ -3,22 +3,20 @@
 
 plugin core;
 plugin autodiff;
+plugin mem;
 
-fun f(a: I32): I32 =
-    let b = %core.wrap.mul 0 (2I32, a);
-    return b;
+use core.ops.u.w;
 
-con extern main [mem : %mem.M 0, argc : I32, argv : %mem.Ptr (%mem.Ptr (I8, 0), 0), return : Cn [%mem.M 0, I32]] =
-    let f_diff      = %autodiff.ad f;
-    let f_diff_cast = f_diff;
-    let c           = 43I32;
-    f_diff_cast (c,ret_cont)
+fun f(a: I32): I32 = return (2I32 * a);
+
+extern con main (m: mem.M 0, argc: I32, argv: mem.Ptr («core.idx2nat argc; mem.Ptr (mem.Char, 0)», 0), return: Cn [mem.M 0, I32]) =
+    (autodiff.ad f) (43I32, ret_cont)
     where
-        con ret_cont [r: I32, pb: Fn I32 → I32] =
-            pb(1I32,pb_ret_cont)
+        con ret_cont (r: I32, pb: Fn I32 → I32) =
+            pb(1I32, pb_ret_cont)
             where
-                con pb_ret_cont [pr:I32] = return (mem, pr);
+                con pb_ret_cont (pr: I32) = return (m, pr);
             end;
     end;
 
-// CHECK-DAG: return{{.*}}2
+// CHECK-DAG: return_{{[0-9]+}} ({{.*}}, 2I32)

@@ -10,8 +10,7 @@ const Def* normalize_cat(const Def*, const Def* callee, const Def* arg) {
     auto [n, m] = callee->as<App>()->decurry()->args<2>([](auto def) { return Lit::isa(def); });
     if (n && *n == 0) return b;
     if (m && *m == 0) return a;
-    if (n && m) return mim::cat_tuple(*n, *m, a, b);
-    return nullptr;
+    return n && m ? Tuple::cat(*n, *m, a, b) : nullptr;
 }
 
 const Def* normalize_contains(const Def* type, const Def*, const Def* arg) {
@@ -25,6 +24,7 @@ const Def* normalize_contains(const Def* type, const Def*, const Def* arg) {
             return nullptr;
     }
 
+    // FIXME for n = 1, xs is the element itself; and a closed xs doesn't rule out an open x at runtime.
     if (auto tuple = xs->isa<Tuple>()) {
         for (auto op : tuple->ops())
             if (op == x) return w.lit_tt();
@@ -51,12 +51,11 @@ const Def* normalize_zip(const Def* type, const Def* c, const Def* arg) {
 
     // TODO commute
     // TODO reassociate
-    // TODO more than one Os
     // TODO select which Is/Os to zip
 
     if (lr && ls && *lr == 1 && *ls == 1) return w.app(f, arg);
 
-    if (auto l_in = Lit::isa(n_i)) {
+    if (auto l_in = Lit::isa(n_i), l_o = Lit::isa(n_o); l_in && l_o) {
         auto args = arg->projs(*l_in);
 
         if (lr && std::ranges::all_of(args, [](const Def* arg) { return arg->isa<Prod>(); })) {
@@ -73,7 +72,9 @@ const Def* normalize_zip(const Def* type, const Def* c, const Def* arg) {
                         return w.app(w.app(app_zip, is_os), inner_args);
                     }
                 });
-                return w.tuple(elems);
+                return w.tuple(DefVec(*l_o, [&](size_t o) {
+                    return w.tuple(DefVec(*s_n, [&](size_t s_i) { return elems[s_i]->proj(*l_o, o); }));
+                }));
             }
         }
     }

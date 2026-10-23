@@ -1,0 +1,54 @@
+#include "mim/phase/sccp.h"
+
+namespace mim {
+
+const Def* SCCP::Analysis::propagate(Lam* lam, const Def* var, const Def* def) {
+    // `⊥ ⊔ x` is `x`, but unusable if lam nests it.
+    if (lam->nests(def)) return pin(var), var;
+
+    auto cur = lattice(var);
+    if (!cur) { // ⊥ ⊔ def = def; lattice(var, def) invalidates, as it inserts a fresh non-⊤ fact
+        lattice(var, def);
+        log().d("propagate {} → {}", var, def);
+        return def;
+    }
+
+    if (cur == var) return cur; // ⊤ stays ⊤
+
+    // cur ⊔ ⊥ = cur, but the ⊥-site's caller must see cur as well.
+    if (def->isa<Bot>()) {
+        if (auto caller = curr_mut(); caller && !cur->in_scope(caller)) return pin(var), var;
+        return cur;
+    }
+
+    if (cur == def) return cur; // cur ⊔ cur = cur
+
+    if (cur->isa<Bot>()) { // ⊥ ⊔ def = def; lattice(var, def) invalidates, as it overwrites cur
+        lattice(var, def);
+        return def;
+    }
+
+    return pin(var), var; // two different values join to ⊤; lattice(var, var) therein invalidates, as it overwrites cur
+}
+
+const Def* SCCP::Analysis::rewrite_imm_App(const App* app) {
+    if (auto lam = Lam::isa_rewritable(app->callee())) {
+        auto n          = app->num_targs();
+        auto abstr_args = DefVec(n);
+        auto abstr_vars = DefVec(n);
+
+        // propagate
+        for (size_t i = 0; i != n; ++i) {
+            auto abstr    = rewrite(app->targ(i));
+            abstr_vars[i] = propagate(lam, lam->tvar(i), abstr);
+            abstr_args[i] = abstr;
+        }
+
+        lattice(lam->var(), world().tuple(abstr_vars)); // set new abstract var
+        return world().raw_app(rewrite(app->type()), rewrite(lam), world().tuple(abstr_args));
+    }
+
+    return mim::Analysis::rewrite_imm_App(app);
+}
+
+} // namespace mim

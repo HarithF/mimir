@@ -7,11 +7,8 @@
 namespace mim {
 
 const Def* LamSpec::rewrite_imm_App(const App* old_app) {
-    if (is_bootstrapping()) return RWPhase::rewrite_imm_App(old_app);
-    if (auto i = old2new_.find(old_app); i != old2new_.end()) return i->second;
-
-    auto old_lam = old_app->callee()->isa_mut<Lam>();
-    if (!isa_optimizable(old_lam)) return RWPhase::rewrite_imm_App(old_app);
+    auto old_lam = Lam::isa_rewritable(old_app->callee());
+    if (!old_lam) return RWPhase::rewrite_imm_App(old_app);
 
     // Skip recursion to avoid infinite inlining if not "aggressive_lam_spec".
     // This is a hack - but we want to get rid off this stage anyway.
@@ -32,7 +29,7 @@ const Def* LamSpec::rewrite_imm_App(const App* old_app) {
     if (new_doms.size() == lam->num_doms()) return RWPhase::rewrite_imm_App(old_app);
 
     auto& w      = new_world();
-    auto new_lam = lam->stub(w.cn(new_doms));
+    auto new_lam = w.mut_lam(w.cn(new_doms))->set(lam->dbg_key());
 
     // Project new_lam's var with the explicit arity new_doms.size():
     // a single remaining sigma dom is flattened by cn(), so new_lam->var(i) would project into that sigma.
@@ -41,7 +38,7 @@ const Def* LamSpec::rewrite_imm_App(const App* old_app) {
 
     for (size_t arg_i = 0, var_i = 0, n = num_old - skip; arg_i != n; ++arg_i) {
         auto arg = rewrite(old_app->arg(num_old, arg_i));
-        if (lam->dom(arg_i)->isa<Pi>()) {
+        if (doms[arg_i]->isa<Pi>()) {
             new_vars.emplace_back(arg);
         } else {
             new_vars.emplace_back(new_lam->var(num_new, var_i++));
@@ -55,9 +52,9 @@ const Def* LamSpec::rewrite_imm_App(const App* old_app) {
     }
 
     new_lam->set(lam->reduce(w.tuple(new_vars)));
-    DLOG("{} -> {}: {} -> {})", lam, new_lam, lam->dom(), new_lam->dom());
+    log().d("specialize {} → {}: {} → {}", lam, new_lam, lam->dom(), new_lam->dom());
 
-    return old2new_[old_app] = w.app(new_lam, new_args);
+    return w.app(new_lam, new_args);
 }
 
 } // namespace mim

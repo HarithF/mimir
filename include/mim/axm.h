@@ -1,6 +1,6 @@
 #pragma once
 
-#include <fe/assert.h>
+#include <fe/term.h>
 
 #include "mim/plugin.h"
 
@@ -14,7 +14,7 @@ public:
     using Setters<Axm>::set;
 
     /// @name Normalization
-    /// @anchor normalization
+    /// @anchor curry_trip
     /// For a curried App of an Axm, you only want to trigger normalization at specific spots.
     /// For this reason, MimIR maintains a Def::curry_ counter that each App decrements.
     /// The Axm::normalizer() will be triggered when Axm::curry() becomes `0`.
@@ -44,6 +44,11 @@ public:
     /// Yields currying counter of @p def.
     /// @returns `{nullptr, 0, 0}` if no Axm is present.
     static std::tuple<const Axm*, u8, u8> get(const Def* def);
+
+    /// Like Axm::get, but advances the counter as one more App is about to be built on top of @p callee.
+    /// @returns `{nullptr, 0, 0}` if no Axm is present.
+    static std::tuple<const Axm*, u8, u8> next(const Def* callee);
+
     static std::pair<u8, u8> infer_curry_and_trip(const Def* type);
     ///@}
 
@@ -81,7 +86,7 @@ public:
         const Axm* axm() const { return axm_; }
         const D* operator->() const { return def_; }
         operator const D*() const { return def_; }
-        explicit operator bool() { return axm_ != nullptr; }
+        explicit operator bool() const { return axm_ != nullptr; }
         ///@}
 
         /// @name Axm Name
@@ -90,7 +95,7 @@ public:
         auto plugin() const { return axm()->plugin(); } ///< @see Axm::plugin.
         auto tag() const { return axm()->tag(); }       ///< @see Axm::tag.
         auto sub() const { return axm()->sub(); }       ///< @see Axm::sub.
-        auto base() const { return axm()->sub(); }      ///< @see exiom::base.
+        auto base() const { return axm()->base(); }     ///< @see Axm::base.
         auto id() const { return Id(axm()->flags()); }  ///< Axm::flags cast to @p Id.
         ///@}
 
@@ -100,7 +105,7 @@ public:
     };
     ///@}
 
-    /// @name isa/as
+    /// @name Matching
     ///@{
     /// @see @ref cast_axm
     template<class Id, u8 Curry = 0, bool DynCast = true>
@@ -116,7 +121,6 @@ public:
 
     template<class Id, u8 Curry = 0, bool DynCast = true>
     static auto isa(Id id, const Def* def) {
-        // using D              = typename Axm::IsANode<Id>::type;
         using D              = std::conditional_t<Curry == 0, typename Axm::IsANode<Id>::type, Def>;
         auto [axm, curry, _] = Axm::get(def);
         bool cond            = axm && curry == Curry && axm->flags() == (flags_t)id;
@@ -130,6 +134,23 @@ public:
     template<class Id, u8 Curry=0> static auto as(       const Def* def) { return isa<Id, Curry, false>(    def); }
     template<class Id, u8 Curry=0> static auto as(Id id, const Def* def) { return isa<Id, Curry, false>(id, def); }
     // clang-format on
+
+    /// Like Axm::as but - instead of merely asserting in `Debug` builds - bails via Def::bail_expected when
+    /// @p def is not the expected axm.
+    /// @p fmt / @p args describe what was expected; a plain string works, as does a fe::cite_string plus arguments.
+    template<class Id, u8 Curry = 0, class... Args>
+    static auto expect(const Def* def, fe::cite_string<Args...> fmt, Args&&... args) {
+        if (auto res = isa<Id, Curry>(def)) return res;
+        def->bail_expected(fe::format_cite(fmt, std::forward<Args>(args)...));
+    }
+
+    /// Peel off all @p Id Axm%s from @p def.
+    template<class Id>
+    static const Def* peel(const Def* def) {
+        while (auto anno = isa<Id>(def))
+            def = anno->arg();
+        return def;
+    }
     ///@}
 
     static constexpr u8 Trip_End    = u8(-1);
@@ -137,13 +158,10 @@ public:
     static constexpr size_t Num_Ops = 0;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-
     friend class World;
 };
 
 // clang-format off
-template<class Id> concept annex_with_subs    = Annex::num<Id>() != 0;
 template<class Id> concept annex_without_subs = Annex::num<Id>() == 0;
 // clang-format on
 

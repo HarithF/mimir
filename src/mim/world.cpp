@@ -1,27 +1,109 @@
 #include "mim/world.h"
 
-#include <ranges>
+#include <cctype>
+
+#include <algorithm>
+
+#include <fe/container.h>
+#include <fe/restore.h>
+#include <fe/worklist.h>
 
 #include "mim/check.h"
 #include "mim/def.h"
 #include "mim/driver.h"
 #include "mim/rewrite.h"
-#include "mim/schedule.h"
 #include "mim/tuple.h"
 
-#include "mim/util/util.h"
+#include "mim/util/gid.h"
 
 namespace mim {
 
 namespace {
 
-bool is_shape(const Def* s) {
-    if (s->isa<Nat>()) return true;
-    if (auto arr = s->isa<Arr>()) return arr->body()->zonk()->isa<Nat>();
-    if (auto sig = s->isa_imm<Sigma>())
-        return std::ranges::all_of(sig->ops(), [](const Def* op) { return op->isa<Nat>(); });
+/// Arity `d#index ← val` unrolls a Pack @p d into; `std::nullopt` if the Pack rule in World::insert doesn't fire.
+/// A fused Pack is off limits: its Def::arity is only the front axis, while Pack::body is still the scalar.
+std::optional<nat_t> pack_unrolls(const Def* d, const Def* index, u64 threshold) {
+    if (!Lit::isa(index)) return {};
+    if (auto pack = d->isa<Pack>(); pack && !pack->shape().is_fused())
+        if (auto a = Lit::isa(pack->arity()); a && *a < threshold) return a;
+    return {};
+}
 
-    return false;
+/// Does `d#index ← val` rebuild an aggregate right away? Mirrors the two folding rules in World::insert.
+bool insert_rebuilds(const Def* d, const Def* index, u64 threshold) {
+    if (d->isa<Tuple>()) return bool(Lit::isa(index));
+    return bool(pack_unrolls(d, index, threshold));
+}
+
+/// How many axes @p type indexes in one go; `1` for anything that isn't an Arr, `std::nullopt` for a dynamic rank.
+std::optional<nat_t> own_rank(const Def* type) {
+    if (auto arr = type->isa<Arr>()) return arr->shape().rank();
+    return 1;
+}
+
+/// `(t#is)#js` as *one* index into @p t; `nullptr` unless @p t's own shape has room for both ranks.
+/// The Extract and the Insert rule are duals and share this check.
+Shape fused_index(const Def* t, Shape is, Shape js) {
+    auto arr = t->unfold_type()->isa<Arr>();
+    if (!arr) return {};
+    auto ri = is.rank();
+    auto rj = js.rank();
+    auto rt = arr->shape().rank();
+    if (!ri || !rj || !rt || *ri + *rj > *rt) return {};
+    return is + js;
+}
+
+/// Coerces @p val to @p elem_type or bails out with the "not assignable" diagnostic.
+const Def* assign_or_bail(const Def* elem_type, const Def* val) {
+    auto res = Check::coerce(elem_type, val);
+    if (!res)
+        val->blame("value is not assignable to element type")
+            .n("expected `{}`, got `{}`", elem_type, type_of(val))
+            .bail();
+    return res;
+}
+
+/// Checks the multi-dimensional @p index against @p d and yields the type it peels to.
+const Def* nary_elem_type(const Def* d, Shape index) {
+    auto type = d->unfold_type();
+    auto arr  = type->isa<Arr>();
+    if (!arr) index->blame("multi-dimensional index expects an array but got `{}`", type).bail();
+
+    auto shape = arr->shape();
+    auto ri    = index.rank();
+    auto rt    = shape.rank();
+    // A *partial* index peels only its own axes and yields a sub-array.
+    auto fit = ri && rt ? *ri <= *rt : Check::alpha(index->arity(), shape->arity());
+    if (!fit)
+        index->blame("index of rank `{}` does not fit shape `{}` of rank `{}`", index->arity(), *shape, shape->arity())
+            .bail();
+
+    // Only the axes World::extract folds away reach World::extract1's check, so the ones staying fused
+    // need it here. A fused shape never binds the Arr's own var, so its extents compare as they stand.
+    if (ri && rt)
+        for (nat_t i = 0; i != *ri; ++i)
+            if (auto size = Idx::isa(index[i]->unfold_type()); size && !Check::alpha(shape[i], size))
+                index[i]->blame("index does not fit within arity `{}`", shape[i]).bail();
+
+    return d->world().peel(arr, *index);
+}
+
+/// A fresh mutable Seq of @p seq's kind holding @p elem at @p shape, whose body @p rest computes from its own var.
+const Def* mut_shaped(const Seq* seq, Shape shape, const Def* elem, auto rest) {
+    auto& w      = seq->world();
+    auto is_pack = seq->is_intro();
+    auto res     = w.mut_seq(is_pack, is_pack ? w.arr(shape, elem) : seq->type());
+    res->Def::set(0, *shape);
+    return res->Def::set(1, rest(res))->zonk_mut();
+}
+
+/// Marks a World::Reduct slot while it is being computed: seeing it again means the op requires its own reduction.
+const Def* const Filling = (const Def*)1;
+
+/// Sorts by gid and drops duplicates; Def%s are hash-consed, so pointer identity *is* structural identity.
+void sort_unique(DefVec& defs) {
+    std::ranges::sort(defs, GIDLt<const Def*>());
+    defs.erase(std::unique(defs.begin(), defs.end()), defs.end());
 }
 
 } // namespace
@@ -30,7 +112,7 @@ void World::Externals::externalize(Def* def) {
     assert(!def->is_external());
     assert(def->is_closed());
     def->external_ = true;
-    assert_emplace(sym2mut_, def->sym(), def);
+    fe::assert_emplace(sym2mut_, def->sym(), def);
 }
 
 void World::Externals::internalize(Def* def) {
@@ -41,44 +123,69 @@ void World::Externals::internalize(Def* def) {
 }
 
 const Def* World::Annexes::attach(flags_t flags, Sym sym, const Def* def) {
-    driver().TLOG("register: 0x{:x} -> {} ({})", flags, def, sym);
-    auto plugin = Annex::demangle(driver(), flags);
-    if (driver().is_loaded(plugin)) {
-        assert_emplace(flags2entry_, flags, Annexes::Entry{sym, def});
-        assert_emplace(sym2flags_, sym, flags);
+    driver().log().t("register annex `{}` 0x{:x} → {}", sym, flags, def);
+    if (driver().is_loaded(Annex::demangle(flags))) {
+        fe::assert_emplace(flags2entry_, flags, Annexes::Entry{sym, def});
+        fe::assert_emplace(sym2flags_, sym, flags);
+        def2flags_.emplace(def, flags);
         def->annex_ = true;
         return def;
     }
     return nullptr;
 }
 
+void World::Annexes::attach_alias(flags_t flags, Sym sym) {
+    if (!driver().is_loaded(Annex::demangle(flags))) return;
+    // An alias spelled the same as its target's own (unqualified) name registers the identical
+    // qualified string as the target - a benign no-op, not a conflict.
+    if (auto [i, ins] = sym2flags_.try_emplace(sym, flags); !ins) assert(i->second == flags);
+}
+
+/*
+ * Library
+ */
+
+const Def* World::annex(Sym sym) {
+    if (auto flags = fe::lookup(annexes().sym2flags(), sym)) return annex(*flags);
+    if (auto lib = driver().library())
+        if (auto flags = fe::lookup(lib->annexes().sym2flags(), sym)) return annex(*flags);
+    return nullptr;
+}
+
+const Def* World::annex_miss(flags_t flags) {
+    if (auto lib = driver().library(); lib && lib != this)
+        if (auto e = fe::lookup(lib->annexes().flags2entry(), flags)) {
+            log().d("import annex `{}`", e->sym);
+            return annexes().attach(flags, e->sym, import(e->def));
+        }
+
+    fe::throwf("no Axm with ID {}; is plugin `{}` loaded?", flags, Annex::demangle(flags));
+}
+
 /*
  * constructor & destructor
  */
-
-#if (!defined(_MSC_VER) && defined(NDEBUG))
-bool World::Lock::guard_ = false;
-#endif
 
 World::World(Driver* driver, const State& state)
     : driver_(driver)
     , zonker_(*this)
     , state_(state)
+    , importer_(*this)
     , move_(driver) {
-    data_.univ        = insert<Univ>(*this);
-    data_.lit_univ_0  = lit_univ(0);
-    data_.lit_univ_1  = lit_univ(1);
-    data_.type_0      = type(lit_univ_0());
-    data_.type_1      = type(lit_univ_1());
+    data_.type_level  = insert<Level>(*this);
+    data_.lit_level_0 = lit(type_level(), 0);
+    data_.lit_level_1 = lit(type_level(), 1);
+    data_.type_0      = unify<Type>(lit_level_0());
+    data_.type_1      = unify<Type>(lit_level_1());
     data_.type_bot    = insert<Bot>(type());
     data_.type_top    = insert<Top>(type());
-    data_.sigma       = unify<Sigma>(type(), Defs{})->as<Sigma>();
-    data_.tuple       = unify<Tuple>(sigma(), Defs{})->as<Tuple>();
+    data_.sigma       = unify<Sigma>(type(), Defs{});
+    data_.tuple       = unify<Tuple>(sigma(), Defs{});
     data_.type_nat    = insert<mim::Nat>(*this);
     data_.type_idx    = insert<mim::Idx>(pi(type_nat(), type()));
-    data_.top_nat     = insert<Top>(type_nat());
-    data_.lit_nat_0   = lit_nat(0);
-    data_.lit_nat_1   = lit_nat(1);
+    // A frozen World cannot create them on demand, but e.g. Def::num_tprojs needs them to compute an arity.
+    for (nat_t i = 0; i != Num_Lit_Nats; ++i)
+        data_.lit_nats[i] = lit(type_nat(), i);
     data_.lit_idx_1_0 = lit_idx(1, 0);
     data_.type_bool   = type_idx(2);
     data_.lit_bool[0] = lit_idx(2, 0_u64);
@@ -89,16 +196,20 @@ World::World(Driver* driver, const State& state)
 World::World(Driver* driver, Sym name)
     : World(driver, State(name)) {}
 
-World::~World() {
-    for (auto def : move_.defs)
-        def->~Def();
-}
+// ~Def() has nothing to do, so World does not run it.
+World::~World() = default;
+
+static_assert(std::is_trivially_destructible_v<Dbg> && std::is_trivially_destructible_v<Vars>
+                  && std::is_trivially_destructible_v<Muts> && std::is_trivially_destructible_v<NormalizeFn>,
+              "a Def member gained a non-trivial destructor: World::~World must destroy Defs again");
 
 /*
  * Driver
  */
 
-Log& World::log() const { return driver().log(); }
+fe::Error& World::error() { return driver().error(); }
+const fe::Error& World::error() const { return driver().error(); }
+const fe::Log& World::log() const { return driver().log(); }
 Flags& World::flags() { return driver().flags(); }
 
 Sym World::sym(const char* s) { return driver().sym(s); }
@@ -113,92 +224,180 @@ const Type* World::type(const Def* level) {
     if (!level) return nullptr;
     level = level->zonk();
 
-    if (!level->type()->isa<Univ>())
-        error(level->loc(), "argument `{}` to `Type` must be of type `Univ` but is of type `{}`", level, level->type());
+    if (!level->isa_type<Level>())
+        level->blame("argument to `Type` must be of type `Level` but is of type `{}`", type_of(level)).bail();
 
-    return unify<Type>(level)->as<Type>();
+    if (level == lit_level_0()) return data_.type_0;
+    if (level == lit_level_1()) return data_.type_1;
+    return unify<Type>(level);
 }
 
-const Def* World::uinc(const Def* op, level_t offset) {
+const Def* World::lsucc(const Def* op, level_t offset) {
     op = op->zonk();
 
-    if (!op->type()->isa<Univ>())
-        error(op->loc(), "operand '{}' of a universe increment must be of type `Univ` but is of type `{}`", op,
-              op->type());
+    if (!op->isa_type<Level>())
+        op->blame("operand of a level successor must be of type `Level` but is of type `{}`", type_of(op)).bail();
 
-    if (auto l = Lit::isa(op)) return lit_univ(*l + 1);
-    return unify<UInc>(op, offset);
+    if (offset == 0) return op;
+    if (auto l = Lit::isa(op)) return lit_level(*l + offset);
+    if (auto inc = op->isa<LSucc>()) return lsucc(inc->op(), inc->offset() + offset);
+    if (auto max = op->isa<LMax>()) return lmax(DefVec(max->ops(), [&](const Def* op) { return lsucc(op, offset); }));
+    return unify<LSucc>(op, offset);
 }
 
-static void flatten_umax(DefVec& ops, const Def* def) {
-    if (auto umax = def->isa<UMax>())
-        for (auto op : umax->ops())
-            flatten_umax(ops, op);
-    else
-        ops.emplace_back(def);
-}
-
-template<int sort>
-const Def* World::umax(Defs ops_) {
-    DefVec ops;
-    for (auto op : ops_) {
-        op = op->zonk();
-
-        if constexpr (sort == UMax::Term) op = op->unfold_type();
-        if constexpr (sort >= UMax::Type) op = op->unfold_type();
-        if constexpr (sort >= UMax::Kind) {
-            if (auto type = op->isa<Type>())
-                op = type->level();
-            else
-                error(op->loc(), "operand '{}' must be a Type of some level", op); // TODO better error message
-        }
-
-        flatten_umax(ops, op);
-    }
-
+const Def* World::lmax(Defs levels) {
     level_t lvl = 0;
-    DefVec res;
-    for (auto op : ops) {
-        if (!op->type()->isa<Univ>())
-            error(op->loc(), "operand '{}' of a universe max must be of type 'Univ' but is of type '{}'", op,
-                  op->type());
-
+    auto ops    = DefVec();
+    auto push   = [&](const Def* op) {
         if (auto l = Lit::isa(op))
             lvl = std::max(lvl, *l);
         else
-            res.emplace_back(op);
+            ops.emplace_back(op);
+    };
+
+    for (auto level : levels) {
+        level = level->zonk();
+        if (!level->isa_type<Level>())
+            level->blame("operand of a level max must be of type `Level` but is of type `{}`", type_of(level)).bail();
+
+        // A zonked LMax is already flat, so one level suffices.
+        if (auto max = level->isa<LMax>())
+            for (auto op : max->ops())
+                push(op);
+        else
+            push(level);
     }
 
-    const Def* l = lit_univ(lvl);
-    if (res.empty()) return sort == UMax::Univ ? l : type(l);
-    if (lvl > 0) res.emplace_back(l);
-
-    std::ranges::sort(res, [](auto op1, auto op2) { return op1->gid() < op2->gid(); });
-    res.erase(std::unique(res.begin(), res.end()), res.end());
-    const Def* umax = unify<UMax>(*this, res);
-    return sort == UMax::Univ ? umax : type(umax);
+    if (lvl > 0 || ops.empty()) ops.emplace_back(lit_level(lvl));
+    sort_unique(ops);
+    return ops.size() == 1 ? ops.front() : unify<LMax>(*this, ops);
 }
 
-// TODO more thorough & consistent checks for singleton types
+static void default_level(const Def* level) {
+    if (auto hole = Hole::isa_unset(level))
+        hole->set(hole->world().lit_level(0));
+    else if (auto inc = level->isa<LSucc>())
+        default_level(inc->op()->zonk());
+    else if (auto max = level->isa<LMax>())
+        for (auto op : max->ops())
+            default_level(op->zonk());
+}
+
+// The value of @p level with all its unset Hole%s read as `0`.
+static level_t eval0(const Def* level) {
+    level = level->zonk();
+    if (auto l = Lit::isa(level)) return *l;
+    if (auto succ = level->isa<LSucc>()) return eval0(succ->op()) + succ->offset();
+    if (auto max = level->isa<LMax>()) {
+        auto res = level_t(0);
+        for (auto op : max->ops())
+            res = std::max(res, eval0(op));
+        return res;
+    }
+    assert(Hole::isa_unset(level));
+    return 0;
+}
+
+void World::solve_levels() {
+    // Retry first: Hole%s solved in the meantime may have turned a constraint into one that determines the rest.
+    for (auto eq : std::exchange(move_.levels, {})) {
+        auto _ = push(eq.loc);
+        if (!Check::alpha(eq.lmax, eq.level))
+            error().e(eq.loc, "universe level `{}` does not match `{}`", eq.lmax->zonk(), eq.level->zonk()).bail();
+    }
+
+    auto eqs = std::exchange(move_.levels, {});
+    for (auto eq : eqs)
+        if (eval0(eq.lmax) != eval0(eq.level))
+            error()
+                .e(eq.loc, "ambiguous universe levels: `{}` = `{}` has no unique solution", eq.lmax->zonk(),
+                   eq.level->zonk())
+                .bail();
+
+    for (auto eq : eqs) {
+        default_level(eq.lmax->zonk());
+        default_level(eq.level->zonk());
+    }
+}
+
+// An untyped binder used as a type has a Hole as sort, which must be a Type of some yet unknown level.
+static const Def* level_of(const Def* type) {
+    if (auto kind = type->zonk()->unfold_type()) {
+        kind = kind->zonk();
+        if (auto t = kind->isa<Type>()) return t->level();
+        if (auto hole = Hole::isa_unset(kind)) {
+            auto& w    = type->world();
+            auto level = w.mut_hole_level();
+            if (Check::alpha(hole, w.type(level))) return level;
+        }
+    }
+    type->blame("`{}` is not a type", type).bail();
+}
+
+const Def* World::level(Defs types) {
+    auto lvl    = level_t(0);
+    auto levels = DefVec();
+    for (auto type : types) {
+        auto level = level_of(type);
+        if (auto l = Lit::isa(level))
+            lvl = std::max(lvl, *l);
+        else
+            levels.emplace_back(level);
+    }
+
+    if (levels.empty()) return lit_level(lvl);
+    levels.emplace_back(lit_level(lvl));
+    return lmax(levels);
+}
+
+const Def* World::inhabitant_(const Def* type) {
+    switch (type->node()) {
+        case Node::Single: return wrap(type->as<Single>()->op());
+        case Node::Sigma: {
+            auto sigma = type->as<Sigma>();
+            if (sigma->num_ops() == 0) return tuple(sigma, {});
+            if (sigma->isa_mut()) return nullptr;
+            auto ops = DefVec();
+            for (auto op : sigma->ops())
+                if (auto i = inhabitant(op))
+                    ops.emplace_back(i);
+                else
+                    return nullptr;
+            return tuple(sigma, ops);
+        }
+        case Node::Arr:
+            if (auto arr = type->isa_imm<Arr>())
+                if (auto i = inhabitant(arr->body())) return pack(arr->shape(), i);
+            return nullptr;
+        case Node::Variant:
+            if (auto lone = Variant::isa_lone(type))
+                if (auto i = inhabitant(lone)) return inj(type, 0, i);
+            return nullptr;
+        default: return nullptr;
+    }
+}
 
 const Def* World::var(Def* mut) {
     if (auto var = mut->var_) return var;
 
-    if (auto var_type = mut->var_type()) { // could be nullptr, if frozen
-        if (auto s = Idx::isa(var_type)) {
-            if (auto l = Lit::isa(s); l && l == 1) return lit_idx_1_0();
-        } else if (auto s = var_type->isa<Sigma>(); s && s->num_ops() == 0)
-            return tuple(s, {});
-    }
+    if (auto var_type = mut->var_type()) // could be nullptr, if frozen
+        if (auto inhabitant = this->inhabitant(var_type)) return inhabitant;
 
     return mut->var_ = unify<Var>(mut);
 }
 
+const Def* World::implicit_holes(const Def* callee) {
+    while (auto type = callee->unfold_type()) // Level has no type at all and takes no implicit arguments
+        if (auto pi = Pi::isa_implicit(type->zonk()))
+            callee = app(callee, mut_hole(pi->dom()));
+        else
+            break;
+    return callee;
+}
+
 template<bool Normalize>
 const Def* World::implicit_app(const Def* callee, const Def* arg) {
-    while (auto pi = Pi::isa_implicit(callee->type()))
-        callee = app(callee, mut_hole(pi->dom()));
-    return app<Normalize>(callee, arg);
+    return app<Normalize>(implicit_holes(callee), arg);
 }
 
 template<bool Normalize>
@@ -206,25 +405,30 @@ const Def* World::app(const Def* callee, const Def* arg) {
     callee = callee->zonk();
     arg    = arg->zonk();
 
-    auto pi = callee->type()->isa<Pi>();
-    if (!pi)
-        throw Error()
-            .error(callee->loc(), "called expression not of function type")
-            .error(callee->loc(), "'{}' <--- callee type", callee->type());
+    // Any other hash-consed callee keeps the Loc of wherever it was first built, if any.
+    auto declared_here = [callee](fe::Error& err) -> fe::Error& {
+        if (callee->isa_mut() || callee->isa<Var>() || callee->isa<Lam>() || callee->isa<Axm>())
+            err.n(callee->loc(), "callee `{}` declared here", callee);
+        return err;
+    };
 
-    auto new_arg = Checker::assignable(pi->dom(), arg);
+    auto pi = callee->isa_type<Pi>();
+    if (!pi)
+        declared_here(
+            callee->blame("callee is not of function type").n("callee `{}` has type `{}`", callee, type_of(callee)))
+            .bail();
+
+    auto new_arg = Check::coerce(pi->dom(), arg);
+    if (!new_arg && is_lenient()) new_arg = arg;
     if (!new_arg)
-        throw Error()
-            .error(arg->loc(), "cannot apply argument to callee")
-            .note(callee->loc(), "callee: '{}'", callee)
-            .note(arg->loc(), "argument: '{}'", arg)
-            .note(callee->loc(), "vvv domain type vvv\n'{}'\n'{}'", pi->dom(), arg->type())
-            .note(arg->loc(), "^^^ argument type ^^^");
+        declared_here(arg->blame("argument is not assignable to callee's domain")
+                          .n("expected `{}`, got `{}`", pi->dom(), type_of(arg)))
+            .bail();
 
     // re-zonk after assignable check above - we might have inferred new stuff
     arg    = new_arg->zonk();
     callee = callee->zonk();
-    pi     = callee->type()->isa<Pi>();
+    pi     = callee->isa_type<Pi>();
 
     // always β-reduce non-recursive, non-parametric lambdas
     if (auto imm = callee->isa_imm<Lam>()) return imm->body();
@@ -240,24 +444,23 @@ const Def* World::app(const Def* callee, const Def* arg) {
         if (lam->filter() != lit_ff()) {
             if (!var) {
                 if (lam->filter() == lit_tt()) return lam->body();
-            } else if (auto i = move_.substs.find({var, arg}); i != move_.substs.end()) {
-                // Reuse the cached reduct if its filter held.
-                auto [filter, body] = i->second->defs<2>();
-                if (filter == lit_tt()) return body;
-            } else {
-                // Evaluate the filter; if it holds, reduce the body and cache the reduct.
-                auto rw     = VarRewriter(var, arg);
-                auto filter = rw.rewrite(lam->filter());
-                if (filter == lit_tt()) {
-                    DLOG("partial evaluate: {} ({})", lam, arg);
-                    auto body        = rw.rewrite(lam->body());
-                    auto size        = sizeof(Reduct) + 2 * sizeof(const Def*);
-                    auto buf         = move_.arena.substs.allocate(size, alignof(const Def*));
-                    auto reduct      = new (buf) Reduct(2);
-                    reduct->defs_[0] = filter;
-                    reduct->defs_[1] = body;
-                    assert_emplace(move_.substs, std::pair{var, arg}, reduct);
-                    return body;
+            } else if (is_frozen()) {
+                if (cached_reduct(var, arg, 0) == lit_tt())
+                    if (auto body = cached_reduct(var, arg, 1)) return body;
+            } else if (reduce(var, arg, 0) == lit_tt()) {
+                // Re-entering a body that is still being reduced for this very arg would not terminate.
+                auto i    = move_.substs.find({var, arg});
+                auto body = i != move_.substs.end() ? i->second->ops()[1] : nullptr;
+                if (body != Filling) {
+                    if (body) return reduce(var, arg, 1);
+                    if (data_.pe_depth == flags().pe_fuel)
+                        callee->blame("partial evaluation of `{}` ran out of fuel", lam)
+                            .n("nested more than {} partial evaluations; raise the limit with `--pe-fuel`",
+                               flags().pe_fuel)
+                            .bail();
+                    log().d("partially evaluate `{} ({})`", lam, arg);
+                    auto _ = fe::Restore(data_.pe_depth, data_.pe_depth + 1);
+                    return reduce(var, arg, 1);
                 }
             }
         }
@@ -265,14 +468,11 @@ const Def* World::app(const Def* callee, const Def* arg) {
 
     auto type               = pi->reduce(arg)->zonk();
     callee                  = callee->zonk();
-    auto [axm, curry, trip] = Axm::get(callee);
-    if (axm) {
-        curry = curry == 0 ? trip : curry;
-        curry = curry == Axm::Trip_End ? curry : curry - 1;
+    auto [axm, curry, trip] = Axm::next(callee);
 
+    if (axm)
         if (auto normalizer = axm->normalizer(); Normalize && normalizer && curry == 0)
             if (auto norm = normalizer(type, callee, arg)) return norm;
-    }
 
     return raw_app(axm, curry, trip, type, callee, arg);
 }
@@ -282,16 +482,12 @@ const Def* World::raw_app(const Def* type, const Def* callee, const Def* arg) {
     callee = callee->zonk();
     arg    = arg->zonk();
 
-    auto [axm, curry, trip] = Axm::get(callee);
-    if (axm) {
-        curry = curry == 0 ? trip : curry;
-        curry = curry == Axm::Trip_End ? curry : curry - 1;
-    }
-
+    auto [axm, curry, trip] = Axm::next(callee);
     return raw_app(axm, curry, trip, type, callee, arg);
 }
 
 const Def* World::raw_app(const Axm* axm, u8 curry, u8 trip, const Def* type, const Def* callee, const Def* arg) {
+    if (auto inhabitant = this->inhabitant(type)) return inhabitant;
     return unify<App>(axm, curry, trip, type, callee, arg);
 }
 
@@ -301,7 +497,7 @@ const Def* World::sigma(Defs ops) {
     if (n == 1) return ops[0]->zonk();
 
     auto zops = Def::zonk(ops);
-    if (auto uni = Checker::is_uniform(zops)) return arr(n, uni);
+    if (auto uni = Check::is_uniform(zops)) return arr(n, uni);
     return unify<Sigma>(Sigma::infer(*this, zops), zops);
 }
 
@@ -310,17 +506,25 @@ const Def* World::tuple(Defs ops) {
     if (n == 0) return tuple();
     if (n == 1) return ops[0]->zonk();
 
-    auto zops  = Def::zonk(ops);
+    auto zops = Def::zonk(ops);
+    for (auto op : zops)
+        if (!op->type()) op->blame("`Level` has no type and cannot be a tuple element").bail();
     auto sigma = Tuple::infer(*this, zops);
-    auto t     = tuple(sigma, zops);
-    auto new_t = Checker::assignable(sigma, t);
-    if (!new_t)
-        error(t->loc(), "cannot assign tuple '{}' of type '{}' to incompatible tuple type '{}'", t, t->type(), sigma);
+    // An immutable Sigma means the ops' types differ, so the ops can't be uniform either.
+    auto t     = tuple(sigma, zops, !sigma->isa_imm<Sigma>());
+    auto new_t = Check::coerce(sigma, t);
+    if (!new_t) t->blame("tuple of type `{}` is not assignable to inferred type `{}`", type_of(t), sigma).bail();
 
     return new_t;
 }
 
-const Def* World::tuple(const Def* type, Defs ops_) {
+const Def* World::tuple(const Def* type, Defs ops) {
+    auto t = tuple(type, ops, true);
+    if (auto tup = t->isa<Tuple>()) check_tuple(tup);
+    return t;
+}
+
+const Def* World::tuple(const Def* type, Defs ops_, bool may_be_uniform) {
     // TODO type-check type vs inferred type
     type     = type->zonk();
     auto ops = Def::zonk(ops_);
@@ -329,92 +533,186 @@ const Def* World::tuple(const Def* type, Defs ops_) {
     if (!type->isa_mut<Sigma>()) {
         if (n == 0) return tuple();
         if (n == 1) return ops[0];
-        if (auto uni = Checker::is_uniform(ops)) return pack(n, uni);
+        if (may_be_uniform)
+            if (auto uni = Check::is_uniform(ops)) return pack(n, uni);
     }
 
-    if (n != 0) {
-        // eta rule for tuples:
-        // (extract(tup, 0), extract(tup, 1), extract(tup, 2)) -> tup
-        if (auto extract = ops[0]->isa<Extract>()) {
-            auto tup = extract->tuple();
-            bool eta = tup->type() == type;
-            for (size_t i = 0; i != n && eta; ++i) {
-                if (auto extract = ops[i]->isa<Extract>()) {
-                    if (auto index = Lit::isa(extract->index())) {
-                        if (eta &= u64(i) == *index) {
-                            eta &= extract->tuple() == tup;
-                            continue;
-                        }
-                    }
-                }
-                eta = false;
-            }
-
-            if (eta) return tup;
+    // eta rule for tuples: (extract(tup, 0), extract(tup, 1), extract(tup, 2)) -> tup
+    if (auto ex0 = n != 0 ? ops[0]->isa<Extract>() : nullptr) {
+        auto tup = ex0->tuple();
+        bool eta = tup->type() == type;
+        for (size_t i = 0; i != n && eta; ++i) {
+            auto ex = ops[i]->isa<Extract>();
+            auto id = ex ? Lit::isa(ex->index()) : std::nullopt;
+            eta     = ex && id && *id == u64(i) && ex->tuple() == tup;
         }
+
+        if (eta) return tup;
     }
 
     return unify<Tuple>(type, ops);
 }
 
-const Def* World::tuple(Sym sym) {
-    DefVec defs;
-    std::ranges::transform(sym, std::back_inserter(defs), [this](auto c) { return lit_i8(c); });
-    return tuple(defs);
+void World::check_tuple(const Tuple* t) {
+    auto type = t->type();
+    auto n    = t->num_ops();
+    if (!type->isa<Sigma>() && !type->isa<Arr>()) return;
+    if (auto a = Lit::isa(type->arity()); a && *a != n)
+        t->blame("tuple has {} elements but its type `{}` has arity `{}`", n, type, type->arity()).bail();
+
+    for (size_t i = 0; i != n; ++i) {
+        auto expected = component(type, t->ops(), n, i);
+        auto op       = t->op(i);
+        if (!Check::coerce(expected, op) && !is_lenient())
+            op->blame("tuple element is not assignable to its type")
+                .n("expected `{}`, got `{}` in `{}`", expected, type_of(op), type)
+                .bail();
+    }
 }
 
-bool isa_indicies(const Def* def) {
-    if (Idx::isa(def)) return true;
-    if (auto sigma = def->isa<Sigma>()) return std::ranges::all_of(sigma->ops(), [](auto op) { return Idx::isa(op); });
-    if (auto arr = def->isa<Arr>()) return Idx::isa(arr->body());
+const Def* World::component(const Def* type, Defs parts, size_t n, size_t i) {
+    if (auto var = type->isa_binder<Sigma>().second) {
+        auto args = DefVec(n, [&](size_t k) { return k < parts.size() ? parts[k] : var->proj(n, k); });
+        return reduce(var, tuple(args), i);
+    }
+    if (auto arr = type->isa_imm<Arr>()) return arr->elem();
+    return type->proj(n, i);
+}
+
+const Def* World::tuple(Sym sym) {
+    return tuple(DefVec(sym, [this](char c) { return lit_i8(c); }));
+}
+
+const Def* World::extract(const Def* d, const Def* index_) {
+    if (!d || !index_) return nullptr; // can happen if frozen
+    d = d->zonk();
+
+    auto index = check_index(index_->zonk());
+    if (index.is_dim()) return extract1(d, *index);
+
+    auto r = index.rank();
+    if (!r) return extract_fused(d, index); // a dynamic rank has no axes to fold one by one
+    if (*r == 0) return d;                  // the index folded away entirely, i.e. `d` is its own only element
+
+    // Fold from the left as far as `d` allows; whatever is left stays *fused*, mirroring `«a, b; T»`.
+    for (nat_t i = 0; i != *r; ++i) {
+        auto c    = index[i];
+        auto next = extract1(d, c);
+        if (auto ex = next->isa<Extract>(); ex && ex->tuple() == d && ex->index() == c)
+            return extract_fused(d, index.drop(i));
+        d = next;
+    }
+
+    return d;
+}
+
+/// Validates @p index and folds its literal size-1 axes away, mirroring the ones World::seq folds out of a shape:
+/// `d#(i, 0₁, k)` ≡ `d#(i, k)`. A *scalar* index is left alone - its `Idx 1` carve-out for mutable 1-tuples still
+/// applies - and so is a dynamic rank, which has no axes to inspect.
+Shape World::check_index(const Def* index) {
+    auto type = index->unfold_type(); // nullptr for Level, which the diagnostic below reports
+    if (type && Idx::isa(type)) return index;
+    if (!type || !Shape::isa_indices(type)) {
+        auto& err = index->blame("index must be of `Idx` type but is of type `{}`", type_of(index));
+        if (auto l = Lit::isa(index); l && type == type_nat())
+            err.n("a bare literal is a `Nat`; an index literal carries its arity, e.g. `{}_{}` for an `Idx {}`", *l,
+                  *l + 1, *l + 1);
+        err.bail();
+    }
+    return Shape(index).fold();
+}
+
+const Def* World::drop(const Seq* s, nat_t k) {
+    auto shape = s->shape();
+    auto r     = shape.rank();
+    if (!r || k > *r || s->has_var()) return nullptr; // a dependent shape needs an index; cf. World::peel
+    if (k == *r) return s->body();
+    if (is_frozen()) return nullptr; // splitting a fused shape builds the sub-Seq
+    return seq(s->is_intro(), shape.drop(k), s->body());
+}
+
+const Def* World::peel(const Seq* seq, const Def* index) {
+    if (!index) return nullptr; // can happen if frozen
+    auto shape = seq->shape();
+    auto rank  = shape.rank();
+    auto k     = Shape(index).rank();
+    if (!rank || !k || *k >= *rank) return seq->reduce(index); // the index covers every axis
+    if (!seq->has_var()) return drop(seq, *k);
+    if (is_frozen()) return nullptr; // splitting a fused shape builds the sub-Seq
+
+    // Dependent: the leading axes come from @p index, the trailing ones from the result's own index.
+    return mut_shaped(seq, shape.drop(*k), seq->body()->unfold_type(),
+                      [&](Seq* res) { return seq->reduce(*(Shape(index) + res->var())); });
+}
+
+const Def* World::fuse(Seq* seq) {
+    auto outer = seq->shape();
+    auto inner = seq->body() ? seq->body()->zonk()->isa<Seq>() : nullptr;
+    auto var   = seq->has_var();
+    // A ragged nest - one whose inner extents depend on the outer index - has no fused shape to spell them in.
+    if (!inner || inner->node() != seq->node() || (var && inner->shape()->has_free_var(var))) return seq->zonk_mut();
+
+    auto ro    = outer.rank();
+    auto shape = outer + inner->shape();
+    if (!ro || !shape) return seq->zonk_mut();
+
+    // The fused index supplies both levels: its leading `ro` axes replace the outer one, the rest the inner.
+    return mut_shaped(seq, shape, inner->body()->unfold_type(), [&](Seq* res) {
+        auto v = Shape(res->var());
+        return seq->reduce(*v.take(*ro))->as<Seq>()->reduce(*v.drop(*ro));
+    });
+}
+
+const Def* World::type_indices(Shape shape) {
+    if (shape.is_dim()) return type_idx(*shape);
+    if (auto r = shape.rank()) return sigma(shape->projs(*r, [this](const Def* e) { return type_idx(e); }));
+
+    // `«i: r; Idx (s#i)»` - a dynamic rank cannot spell out its axes.
+    auto res = mut_arr(type())->set_shape(shape->arity());
+    return res->set_body(type_idx(extract(*shape, res->var())))->zonk_mut();
+}
+
+/// Builds `d#index` for a multi-dimensional @p index that does not fold any further.
+const Def* World::extract_fused(const Def* d, Shape index) {
+    if (index.is_dim()) return extract1(d, *index);
+
+    // An index reaching past `d`'s own shape continues through the element type - `«2; [Nat, Bool]»` is rank 1,
+    // yet `t#(i, j)` is still `t#i#j`. Split it at the boundary, so each Extract matches the shape it indexes.
+    auto ri = index.rank();
+    auto rt = own_rank(d->unfold_type());
+    if (ri && rt && *ri > *rt && !is_frozen()) return extract(extract_fused(d, index.take(*rt)), *index.drop(*rt));
+
+    // `d#is ← val` then `#is` -> `val`; cf. the same rule in World::extract1
+    if (auto insert = d->isa<Insert>(); insert && insert->index() == *index) return insert->value();
+    return unify_elim<Extract>(nary_elem_type(d, index), d, *index);
+}
+
+/// Type-checks a *scalar* @p index of `Idx size` against @p type.
+/// @returns `true` if the axis has folded out of @p type - `«1; T»` ≡ `T` - so that `d#index` *is* `d` and
+/// `d#index ← val` replaces all of it.
+bool World::is_folded_axis(const Def* type, const Def* index, const Def* size) {
+    if (Lit::isa(size) == 1) {
+        // A *mutable* Sigma may be a genuine 1-tuple and still needs a real Extract/Insert; TODO mutable Arr?
+        auto sigma = type->isa_mut<Sigma>();
+        if (!sigma || sigma->num_ops() != 1) return true;
+    }
+
+    if (!Check::alpha(type->arity(), size)) index->blame("index does not fit within arity `{}`", type->arity()).bail();
     return false;
 }
 
-const Def* World::extract(const Def* d, const Def* index) {
-    if (!d || !index) return nullptr; // can happen if frozen
-    d     = d->zonk();
-    index = index->zonk();
+const Def* World::extract1(const Def* d, const Def* index) {
+    auto index_ty = index->unfold_type();
+    auto size     = Idx::isa(index_ty);
+    auto lidx     = Lit::isa(index);
+    auto type     = d->unfold_type();
+    if (!type) d->blame("`Level` has no type and hence no elements to extract").bail();
 
-    if (!isa_indicies(index->type()))
-        error(index->loc(), "index '{}' is not of Idx type but of type '{}'", index, index->type());
-
-    if (auto tuple = index->isa<Tuple>()) {
-        for (auto op : tuple->ops())
-            d = extract(d, op);
-        return d;
-    } else if (auto pack = index->isa<Pack>()) {
-        if (auto a = Lit::isa(index->arity())) {
-            for (nat_t i = 0, e = *a; i != e; ++i) {
-                auto idx = pack->has_var() ? pack->reduce(lit_idx(*a, i)) : pack->body();
-                d        = extract(d, idx);
-            }
-            return d;
-        }
-    }
-
-    auto size = Idx::isa(index->type());
-    auto type = d->unfold_type();
-
-    if (size) {
-        if (auto l = Lit::isa(size); l && *l == 1) {
-            if (auto l = Lit::isa(index); !l || *l != 0) WLOG("unknown Idx of size 1: {}", index);
-            if (auto sigma = type->isa_mut<Sigma>(); sigma && sigma->num_ops() == 1) {
-                // mut sigmas can be 1-tuples; TODO mutables Arr?
-            } else {
-                return d;
-            }
-        }
-    }
-
-    if (size && !Checker::alpha<Checker::Check>(type->arity(), size))
-        error(index->loc(), "index '{}' does not fit within arity '{}'", index, type->arity());
-    // TODO if we have indices we need to check as well that this is compatible with `d`
+    if (is_folded_axis(type, index, size)) return d;
 
     if (auto pack = d->isa<Pack>()) {
-        if (pack->has_var())
-            return pack->reduce(index);
-        else
-            return pack->body();
+        if (pack->shape().is_fused()) return peel(pack, index); // one axis off a fused Pack yields a sub-Pack
+        return pack->reduce(index);
     }
 
     // extract(insert(x, index, val), index) -> val
@@ -422,9 +720,15 @@ const Def* World::extract(const Def* d, const Def* index) {
         if (index == insert->index()) return insert->value();
     }
 
-    if (auto i = Lit::isa(index)) {
-        if (auto hole = d->isa_mut<Hole>()) d = hole->tuplefy(Idx::as_lit(index->type()));
-        if (auto tuple = d->isa<Tuple>()) return tuple->op(*i);
+    // `(t#is)#j` -> `t#(is, j)`: the maximal-rank Extract into one fused Arr is the normal form.
+    if (auto ex = is_frozen() ? nullptr : d->isa<Extract>())
+        if (auto is = fused_index(ex->tuple(), ex->index(), index)) return extract_fused(ex->tuple(), is);
+
+    if (lidx) {
+        // A Hole only tuplefies into a known number of components; a dynamic rank leaves a symbolic Extract.
+        if (auto hole = d->isa_mut<Hole>())
+            if (auto n = Idx::isa_lit(index_ty)) d = hole->tuplefy(*n);
+        if (auto tuple = d->isa<Tuple>()) return tuple->op(*lidx);
 
         // extract(insert(x, j, val), i) -> extract(x, i) where i != j (guaranteed by rule above)
         if (auto insert = d->isa<Insert>()) {
@@ -433,20 +737,42 @@ const Def* World::extract(const Def* d, const Def* index) {
 
         if (auto sigma = type->isa<Sigma>()) {
             if (auto var = sigma->has_var()) {
-                if (is_frozen()) return nullptr; // if frozen, we don't risk rewriting
-                auto t = VarRewriter(var, d).rewrite(sigma->op(*i));
-                return unify<Extract>(t, d, index);
+                if (d == var) return unify_elim<Extract>(sigma->op(*lidx), d, index); // `var -> var` is the identity
+                // Frozen, only an already cached reduct can be replayed - rewriting would create nodes.
+                if (is_frozen()) {
+                    auto t = cached_reduct(var, d, *lidx);
+                    return t ? unify_elim<Extract>(t, d, index) : nullptr;
+                }
+                return unify_elim<Extract>(reduce(var, d, *lidx), d, index);
             }
 
-            return unify<Extract>(sigma->op(*i), d, index);
+            return unify_elim<Extract>(sigma->op(*lidx), d, index);
         }
     }
 
     const Def* elem_t;
-    if (auto arr = type->isa<Arr>())
-        elem_t = arr->reduce(index);
-    else
-        elem_t = join(type->as<Sigma>()->ops());
+    if (auto arr = type->isa<Arr>()) {
+        elem_t = peel(arr, index);
+    } else {
+        auto sigma = type->as<Sigma>();
+        elem_t     = nullptr;
+        // «(a_0, ..., a_{n-1})#index; body» is more precise than the join if all ops are Arrs of the same body.
+        if (sigma->isa_imm()) {
+            const Def* body = nullptr;
+            auto extents    = DefVec();
+            for (auto op : sigma->ops()) {
+                auto op_arr = op->zonk()->isa<Arr>();
+                if (!op_arr || (body && op_arr->body()->zonk() != body)) {
+                    extents.clear();
+                    break;
+                }
+                body = op_arr->body()->zonk();
+                extents.emplace_back(*op_arr->shape());
+            }
+            if (!extents.empty()) elem_t = this->arr(extract(tuple(extents), index), body);
+        }
+        if (!elem_t) elem_t = join(sigma->ops());
+    }
 
     if (index->isa<Top>()) {
         if (auto hole = Hole::isa_unset(d)) {
@@ -457,89 +783,124 @@ const Def* World::extract(const Def* d, const Def* index) {
     }
 
     assert(d);
-    return unify<Extract>(elem_t, d, index);
+    return unify_elim<Extract>(elem_t, d, index);
 }
 
-const Def* World::insert(const Def* d, const Def* index, const Def* val) {
-    d     = d->zonk();
-    index = index->zonk();
-    val   = val->zonk();
+const Def* World::insert(const Def* d, const Def* index_, const Def* val) {
+    d   = d->zonk();
+    val = val->zonk();
 
-    auto type = d->unfold_type();
-    auto size = Idx::isa(index->type());
-    auto lidx = Lit::isa(index);
+    auto type  = d->unfold_type();
+    auto index = check_index(index_->zonk());
 
-    if (!size) error(d->loc(), "index '{}' must be of type 'Idx' but is of type '{}'", index, index->type());
+    // `d#(i, j, k) ← val` stays *fused* unless the outermost write rebuilds an aggregate on the spot.
+    if (!index.is_dim()) {
+        auto r = index.rank();
+        // The index folded away entirely, so the write replaces all of `d`.
+        if (r && *r == 0) return assign_or_bail(type, val);
 
-    if (!Checker::alpha<Checker::Check>(type->arity(), size))
-        error(index->loc(), "index '{}' does not fit within arity '{}'", index, type->arity());
-
-    if (lidx) {
-        auto elem_type = type->proj(*lidx);
-        auto new_val   = Checker::assignable(elem_type, val);
-        if (!new_val) {
-            throw Error()
-                .error(val->loc(), "value to be inserted not assignable to element")
-                .note(val->loc(), "vvv value type vvv \n'{}'\n'{}'", val->type(), elem_type)
-                .note(val->loc(), "^^^ element type ^^^", elem_type);
+        // A write deeper than `d`'s own shape reads down to the boundary and writes the levels back out;
+        // cf. World::extract_fused. So does one whose outermost write rebuilds an aggregate.
+        auto rt  = own_rank(type);
+        auto cut = r && rt && *r > *rt                                            ? rt
+                 : r && insert_rebuilds(d, index[0], flags().scalarize_threshold) ? std::optional<nat_t>(1)
+                                                                                  : std::nullopt;
+        if (cut) {
+            auto head = *index.take(*cut);
+            return insert(d, head, insert(extract(d, head), *index.drop(*cut), val));
         }
-        val = new_val;
+
+        auto new_val = assign_or_bail(nary_elem_type(d, index), val);
+
+        // `d#is ← (d#is)#js ← val` -> `d#(is, js) ← val`; cf. the scalar path below, which reaches this
+        // through World::extract's per-axis loop - the fused path has none, so it needs the rule itself.
+        if (auto inner = is_frozen() ? nullptr : new_val->isa<Insert>())
+            if (auto ex = inner->tuple()->isa<Extract>(); ex && ex->tuple() == d && ex->index() == *index)
+                if (auto is = fused_index(d, *index, inner->index())) return insert(d, *is, inner->value());
+
+        // `d#is ← d#is` -> `d` and `(d#is ← y)#is ← val` -> `d#is ← val`; cf. the scalar path below
+        if (auto ex = new_val->isa<Extract>(); ex && ex->tuple() == d && ex->index() == *index) return d;
+        if (auto insert = d->isa<Insert>(); insert && insert->index() == *index) d = insert->tuple();
+        if (auto inhabitant = this->inhabitant(d->type())) return inhabitant;
+        return unify<Insert>(d, *index, new_val);
     }
 
-    if (auto l = Lit::isa(size); l && *l == 1)
-        return tuple(d, {val}); // d could be mut - that's why the tuple ctor is needed
+    auto size = Idx::isa(index->unfold_type());
+    auto lidx = Lit::isa(*index);
+
+    if (is_folded_axis(type, *index, size)) return assign_or_bail(type, val); // the write replaces all of `d`
+    // A Sigma needs a literal index to name the component; an Arr peels to an element type at any index.
+    if (auto arr = type->isa<Arr>()) {
+        if (auto elem = peel(arr, *index)) val = assign_or_bail(elem, val);
+    } else if (lidx) {
+        val = assign_or_bail(type->proj(Lit::as(size), *lidx), val);
+    }
+    // The only `Idx 1` left is a mutable 1-tuple; d could be mut - that's why the tuple ctor is needed.
+    if (Lit::isa(size) == 1) return tuple(d, {val});
 
     // insert((a, b, c, d), 2, x) -> (a, b, x, d)
-    if (auto t = d->isa<Tuple>(); t && lidx) return t->refine(*lidx, val);
+    if (auto t = d->isa<Tuple>(); t && lidx) {
+        auto new_ops   = DefVec(t->ops().begin(), t->ops().end());
+        new_ops[*lidx] = val;
+        return tuple(type, new_ops);
+    }
 
     // insert(‹4; x›, 2, y) -> (x, x, y, x)
-    if (auto pack = d->isa<Pack>(); pack && lidx) {
-        if (auto a = Lit::isa(pack->arity()); a && *a < flags().scalarize_threshold) {
-            auto new_ops   = DefVec(*a, pack->body());
-            new_ops[*lidx] = val;
-            return tuple(type, new_ops);
-        }
+    if (auto a = pack_unrolls(d, *index, flags().scalarize_threshold)) {
+        auto new_ops   = DefVec(*a, d->as<Pack>()->body());
+        new_ops[*lidx] = val;
+        return tuple(type, new_ops);
     }
+
+    // `d#i ← (d#i)#js ← val` -> `d#(i, js) ← val`: the dual of the Extract fusion in World::extract1, and what
+    // keeps the read-modify-write chain a *single* write. The aggregate-rebuilding rules above win over it.
+    if (auto inner = is_frozen() ? nullptr : val->isa<Insert>())
+        if (auto ex = inner->tuple()->isa<Extract>(); ex && ex->tuple() == d && ex->index() == *index)
+            if (auto is = fused_index(d, *index, inner->index())) return insert(d, *is, inner->value());
+
+    // insert(d, index, d#index) -> d
+    if (auto ex = val->isa<Extract>())
+        if (ex->tuple() == d && ex->index() == *index) return d;
 
     // insert(insert(x, index, y), index, val) -> insert(x, index, val)
     if (auto insert = d->isa<Insert>()) {
-        if (insert->index() == index) d = insert->tuple();
+        if (insert->index() == *index) d = insert->tuple();
     }
 
-    return unify<Insert>(d, index, val);
+    if (auto inhabitant = this->inhabitant(d->type())) return inhabitant;
+    return unify<Insert>(d, *index, val);
 }
 
-const Def* World::seq(bool term, const Def* arity, const Def* body) {
-    arity = arity->zonk();
+const Def* World::seq(bool is_pack, Shape shape, const Def* body) {
+    shape = shape.zonk();
     body  = body->zonk();
 
-    auto arity_ty = arity->unfold_type();
-    if (!is_shape(arity_ty)) error(arity->loc(), "expected arity but got `{}` of type `{}`", arity, arity_ty);
+    auto shape_ty = shape->unfold_type(); // nullptr for Level, which the diagnostic below reports
+    if (!shape_ty || !Shape::isa_extents(shape_ty))
+        shape->blame("expected a shape but got a value of type `{}`", type_of(*shape)).bail();
 
-    if (auto a = Lit::isa(arity)) {
-        if (*a == 0) return unit(term);
-        if (*a == 1) return body;
+    // `«1; T»` ≡ `T`, mirroring `[T]` ≡ `T`, so a literal size-1 axis folds out of the shape.
+    shape  = shape.fold();
+    auto r = shape.rank();
+    if (r) {
+        if (*r == 0) return body;
+        // A literal-`0` extent empties everything below it: `«2, 0, 3; T»` is `«2; []»`, not `[]`.
+        for (nat_t i = 0; i != *r; ++i)
+            if (Shape::extent(shape[i]) == 0) return seq(is_pack, shape.take(i), prod(is_pack));
     }
 
-    // «(a, b, c); body» -> «a; «(b, c); body»»
-    // e.g. when var, but still has array type
-    if (auto arr_arity = arity->type()->isa<Seq>())
-        if (auto lit_arity_arity = Lit::isa(arr_arity->arity())) {
-            DefVec inner_arity(*lit_arity_arity - 1, [&](u64 i) { return arity->proj(*lit_arity_arity, i + 1); });
-            return seq(term, arity->proj(*lit_arity_arity, 0), seq(term, tuple(inner_arity), body));
-        }
+    // `«a; «b; T»»` ≡ `«a, b; T»` - the very compression that already makes `«3; T»` out of `[T, T, T]`,
+    // one level up. A *mutable* body binds an index the fused shape could not express, so it stops fusion.
+    if (auto inner = body->isa_imm<Seq>(); inner && inner->is_intro() == is_pack)
+        if (auto fused = shape + inner->shape()) return seq(is_pack, fused, inner->body());
 
-    if (term) {
-        auto type = arr(arity, body->type());
-        return unify<Pack>(type, body);
-    } else {
-        return unify<Arr>(body->unfold_type(), arity, body);
-    }
+    if (is_pack) return unify<Pack>(arr(shape, body->unfold_type()), *shape, body);
+    return unify<Arr>(body->unfold_type(), *shape, body);
 }
 
-const Def* World::seq(bool term, Defs shape, const Def* body) {
+const Def* World::seq(bool is_pack, Defs shape, const Def* body) {
     if (shape.empty()) return body;
-    return seq(term, shape.rsubspan(1), seq(term, shape.back(), body));
+    return seq(is_pack, tuple(shape), body);
 }
 
 const Lit* World::lit(const Def* type, u64 val) {
@@ -547,12 +908,10 @@ const Lit* World::lit(const Def* type, u64 val) {
     type = type->zonk();
 
     if (auto size = Idx::isa(type)) {
-        if (size->isa<Top>()) {
-            // unsafe but fine
-        } else if (auto s = Lit::isa(size)) {
-            if (*s != 0 && val >= *s) error(type->loc(), "index '{}' does not fit within arity '{}'", size, val);
+        if (auto s = Lit::isa(size)) {
+            if (*s != 0 && val >= *s) type->blame("index `{}` does not fit within arity `{}`", val, size).bail();
         } else if (val != 0) { // 0 of any size is allowed
-            error(type->loc(), "cannot create literal '{}' of 'Idx {}' as size is unknown", val, size);
+            type->blame("cannot create literal `{}` of `Idx {}` as size is unknown", val, size).bail();
         }
     }
 
@@ -567,67 +926,92 @@ template<bool Up>
 const Def* World::ext(const Def* type) {
     type = type->zonk();
 
-    if (auto arr = type->isa<Arr>()) return pack(arr->arity(), ext<Up>(arr->body()));
+    if (auto arr = type->isa<Arr>()) return pack(arr->shape(), ext<Up>(arr->body()));
     if (auto sigma = type->isa<Sigma>())
-        return tuple(sigma, DefVec(sigma->num_ops(), [&](size_t i) { return ext<Up>(sigma->op(i)); }));
+        return tuple(sigma, DefVec(sigma->ops(), [this](const Def* op) { return ext<Up>(op); }));
     return unify<TExt<Up>>(type);
 }
 
-template<bool Up>
-const Def* World::bound(Defs ops_) {
+const Def* World::join(Defs ops_) {
     auto ops = DefVec();
-    for (size_t i = 0, e = ops_.size(); i != e; ++i) {
-        auto op = ops_[i]->zonk();
-        if (!op->isa<TExt<!Up>>()) ops.emplace_back(op); // ignore: ext<!Up>
+    ops.reserve(ops_.size());
+    auto push = [&ops](const Def* op) {
+        if (!op->isa<Bot>()) ops.emplace_back(op);
+    };
+
+    for (auto op_ : ops_) {
+        auto op = op_->zonk();
+        // A nested Join is already flat, so one level suffices to keep the operation associative.
+        if (auto join = op->isa_imm<Join>())
+            for (auto o : join->ops())
+                push(o);
+        else
+            push(op);
     }
 
-    auto kind = umax<UMax::Type>(ops);
+    auto kind = type(level(ops));
+    if (std::ranges::any_of(ops, [](const Def* op) { return op->isa<Top>(); })) return top(kind);
 
-    // has ext<Up> value?
-    if (std::ranges::any_of(ops, [&](const Def* op) -> bool { return op->isa<TExt<Up>>(); })) return ext<Up>(kind);
+    sort_unique(ops);
 
-    // sort and remove duplicates
-    std::ranges::sort(ops, GIDLt<const Def*>());
-    ops.resize(std::distance(ops.begin(), std::unique(ops.begin(), ops.end())));
-
-    if (ops.size() == 0) return ext<!Up>(kind);
+    if (ops.empty()) return bot(kind);
     if (ops.size() == 1) return ops[0];
-
-    // TODO simplify mixed terms with joins and meets?
-    return unify<TBound<Up>>(kind, ops);
-}
-
-const Def* World::merge(const Def* type, Defs ops_) {
-    type     = type->zonk();
-    auto ops = Def::zonk(ops_);
-
-    if (type->isa<Meet>()) {
-        auto types = DefVec(ops.size(), [&](size_t i) { return ops[i]->type(); });
-        return unify<Merge>(meet(types), ops);
-    }
-
-    assert(ops.size() == 1);
-    return ops[0];
-}
-
-const Def* World::merge(Defs ops_) {
-    auto ops = Def::zonk(ops_);
-    return merge(umax<UMax::Term>(ops), ops);
+    return unify<Join>(kind, ops);
 }
 
 const Def* World::inj(const Def* type, const Def* value) {
     type  = type->zonk();
     value = value->zonk();
 
-    if (type->isa<Join>()) return unify<Inj>(type, value);
-    return value;
+    if (type->isa<Variant>())
+        value->blame("injecting into variant type `{}` requires the index of a case", type).bail();
+    if (type->isa<Nom>()) return name(type, value);
+    if (auto join = type->isa<Join>()) {
+        auto value_t = value->unfold_type();
+        // Hole%s are resolved only once no case matches outright, so a mere search never commits to one.
+        auto is_case = [value, value_t](bool infer) {
+            auto alpha
+                = [infer](const Def* a, const Def* b) { return infer ? Check::alpha(a, b) : Check::test_alpha(a, b); };
+            return [=](const Def* c) {
+                // An open value may still turn out to be the singleton's inhabitant.
+                if (auto single = c->isa<Single>())
+                    return alpha(single->op(), value)
+                        || (!value->is_closed() && alpha(single->op()->unfold_type(), value_t));
+                return alpha(value_t, c);
+            };
+        };
+        if (!std::ranges::any_of(join->ops(), is_case(false)) && !std::ranges::any_of(join->ops(), is_case(true)))
+            value->blame("value of type `{}` is not a case of union type `{}`", type_of(value), type).bail();
+        return unify<Inj>(type, value, flags_t(0));
+    }
+    if (auto v = Check::coerce(type, value)) return v;
+    value->blame("value is not assignable to `{}`", type)
+        .n("`{}` is neither a union nor a nominal type, so `inj` into it is the identity", type)
+        .n("expected `{}`, got `{}`", type, type_of(value))
+        .bail();
 }
 
-const Def* World::split(const Def* type, const Def* value) {
+const Def* World::inj(const Def* type, nat_t index, const Def* value) {
     type  = type->zonk();
     value = value->zonk();
 
-    return unify<Split>(type, value);
+    if (auto nom = type->isa<Nom>()) return unify<Name>(nom, inj(nom->op(), index, value));
+    auto variant = type->isa<Variant>();
+    if (!variant) value->blame("cannot inject into case {} of non-variant type `{}`", index, type).bail();
+    if (index >= variant->num_ops())
+        value->blame("variant type `{}` has {} cases but case {} was requested", type, variant->num_ops(), index)
+            .bail();
+    if (auto v = Check::coerce(variant->op(index), value)) return unify<Inj>(type, v, flags_t(index));
+    value->blame("value is not assignable to case {} of variant type `{}`", index, type)
+        .n("expected `{}`, got `{}`", variant->op(index), type_of(value))
+        .bail();
+}
+
+const Def* World::variant(Defs ops) {
+    auto zops = Def::zonk(ops);
+    auto kind = Variant::infer(*this, zops);
+    if (zops.empty()) return bot(kind);
+    return unify<Variant>(kind, zops);
 }
 
 const Def* World::match(Defs ops_) {
@@ -636,105 +1020,215 @@ const Def* World::match(Defs ops_) {
 
     auto scrutinee = ops.front();
     auto arms      = ops.span().subspan(1);
-    auto join      = scrutinee->type()->isa<Join>();
-
-    if (!join) error(scrutinee->loc(), "scrutinee of a test expression must be of union type");
-
-    if (arms.size() != join->num_ops())
-        error(scrutinee->loc(), "test expression has {} arms but union type has {} cases", arms.size(),
-              join->num_ops());
 
     for (auto arm : arms)
-        if (!arm->type()->isa<Pi>())
-            error(arm->loc(), "arm of test expression does not have a function type but is of type '{}'", arm->type());
+        if (!arm->isa_type<Pi>())
+            arm->blame("arm of a match expression does not have a function type but has type `{}`", type_of(arm))
+                .bail();
 
-    std::ranges::sort(arms, [](const Def* arm1, const Def* arm2) {
-        return arm1->type()->as<Pi>()->dom()->gid() < arm2->type()->as<Pi>()->dom()->gid();
-    });
+    auto scrut_t = scrutinee->unfold_type();
+    if (!scrut_t) scrutinee->blame("scrutinee of a match expression has no type").bail();
 
-    const Def* type = nullptr;
-    for (size_t i = 0, e = arms.size(); i != e; ++i) {
-        auto arm = arms[i];
-        auto pi  = arm->type()->as<Pi>();
-        if (!Checker::alpha<Checker::Check>(pi->dom(), join->op(i)))
-            error(arm->loc(),
-                  "domain type '{}' of arm in a test expression does not match case type '{}' in union type", pi->dom(),
-                  join->op(i));
-        type = type ? this->join({type, pi->codom()}) : pi->codom();
+    if (auto variant = scrut_t->isa<Variant>()) {
+        if (arms.size() != variant->num_ops())
+            scrutinee
+                ->blame("match expression has {} arms but variant type has {} cases", arms.size(), variant->num_ops())
+                .bail();
+
+        const Def* type = nullptr;
+        for (size_t i = 0, e = arms.size(); i != e; ++i) {
+            auto pi = arms[i]->isa_type<Pi>();
+            if (!Check::alpha(pi->dom(), variant->op(i)))
+                arms[i]
+                    ->blame("domain type `{}` of match-expression arm does not match variant case `{}`", pi->dom(),
+                            variant->op(i))
+                    .bail();
+            type = type ? this->join({type, pi->codom()}) : pi->codom();
+        }
+
+        if (auto inj = scrutinee->isa<Inj>()) return app(arms[inj->index()], inj->value());
+        return unify_elim<Match>(type, ops);
     }
 
-    return unify<Match>(type, ops);
+    auto join = scrut_t->isa<Join>();
+
+    // A scrutinee that is not a union is the degenerate one-case union; cf. `d#i` for `i: Idx 1`.
+    auto cases = Match::cases(scrutinee);
+
+    // The first accepting arm handles a case, any later one is dead; arms are *not* sorted, their order is the
+    // tie-break.
+    auto sel = DefVec(cases.size());
+    for (size_t i = 0, e = cases.size(); i != e; ++i) {
+        auto c = cases[i];
+        auto j = std::ranges::find_if(arms, [c](const Def* arm) { return Match::accepts(arm, c); });
+        // Hole%s are resolved only once no arm matches outright, so a mere search never commits to one.
+        if (j == arms.end())
+            j = std::ranges::find_if(arms, [c](const Def* arm) { return Match::accepts(arm, c, true); });
+        if (j == arms.end()) scrutinee->blame("match expression has no arm for union case `{}`", c).bail();
+        sel[i] = *j;
+    }
+
+    // Keep the arms actually selected, in the order written; a dead arm is dropped.
+    auto res        = DefVec();
+    const Def* type = nullptr;
+    res.emplace_back(scrutinee);
+    for (auto arm : arms) {
+        if (!std::ranges::contains(sel, arm)) continue;
+        auto codom = arm->isa_type<Pi>()->codom();
+        type       = type ? this->join({type, codom}) : codom;
+        res.emplace_back(arm);
+    }
+
+    // An arm covering several cases expects the wider union, so narrow values are injected back into it.
+    auto dispatch
+        = [this](const Def* arm, const Def* value) { return app(arm, inj(arm->isa_type<Pi>()->dom(), value)); };
+
+    if (!join) return dispatch(sel[0], scrutinee);
+
+    // A constructor fixes the active union case. Dispatch before the Match can
+    // escape into later lowering phases, where the payload representation may
+    // already have changed (for example, a tensor may have become a buffer).
+    if (auto inj = scrutinee->isa<Inj>()) {
+        auto value = inj->value();
+        for (size_t i = 0, e = cases.size(); i != e; ++i)
+            if (Check::alpha(value->unfold_type(), cases[i])) return dispatch(sel[i], value);
+        scrutinee->blame("injected value type `{}` is not a case of union type `{}`", type_of(value), join).bail();
+    }
+
+    return unify_elim<Match>(type, res);
 }
 
-const Def* World::uniq(const Def* inhabitant) {
-    inhabitant = inhabitant->zonk();
-    return unify<Uniq>(inhabitant->type()->unfold_type(), inhabitant);
+const Def* World::single(const Def* op) {
+    op = op->zonk();
+    if (auto t = op->unfold_type())
+        if (auto tt = t->unfold_type()) return unify<Single>(tt, op);
+    op->blame("operand is too high in the universe hierarchy to inhabit a singleton type")
+        .n("a singleton type sits one level above its inhabitant, and nothing sits above `Level`")
+        .bail();
+}
+
+const Def* World::wrap(const Def* op) {
+    op = op->zonk();
+    return unify<Wrap>(single(op), op);
+}
+
+const Def* World::unwrap(const Def* op) {
+    op = op->zonk();
+    if (auto single = op->isa_type<Single>()) return single->op();
+    op->blame("operand of a singleton elimination is of type `{}` but must be of singleton type", type_of(op)).bail();
+}
+
+const Nom* World::nom(flags_t key, const Def* type) {
+    type = type->zonk();
+    if (auto t = type->unfold_type()) return unify<Nom>(t, type, key);
+    type->blame("`Level` cannot be wrapped in a nominal newtype").bail();
+}
+
+const Def* World::name(const Def* n, const Def* value) {
+    auto nom = n->zonk()->isa<Nom>();
+    value    = value->zonk();
+    if (!nom) value->blame("cannot inject into non-nominal type `{}`", n).bail();
+    if (auto v = Check::coerce(nom->op(), value)) return unify<Name>(nom, v);
+    value->blame("value is not assignable to nominal type `{}`", nom)
+        .n("expected `{}`, got `{}`", nom->op(), type_of(value))
+        .bail();
+}
+
+const Def* World::struc(const Def* value) {
+    value = value->zonk();
+    if (auto name = value->isa<Name>()) return name->op();
+    if (auto nom = value->isa_type<Nom>()) return unify_elim<Struc>(nom->op(), value);
+    value->blame("operand of a nominal elimination is of type `{}` but must be of nominal type", type_of(value)).bail();
 }
 
 Sym World::append_suffix(Sym symbol, std::string suffix) {
     auto name = symbol.str();
-
-    auto pos = name.find(suffix);
-    if (pos != std::string::npos) {
-        auto num = name.substr(pos + suffix.size());
-        if (num.empty()) {
-            name += "_1";
-        } else {
-            num  = num.substr(1);
-            num  = std::to_string(std::stoi(num) + 1);
-            name = name.substr(0, pos + suffix.size()) + "_" + num;
-        }
-    } else {
-        name += suffix;
+    if (auto pos = name.rfind(suffix); pos != std::string::npos) {
+        auto end = pos + suffix.size();
+        auto num = std::string_view(name).substr(end);
+        if (num.empty()) return sym(name + "_1");
+        if (num.size() > 1 && num[0] == '_'
+            && std::ranges::all_of(num.substr(1), [](char c) { return std::isdigit((unsigned char)c); }))
+            return sym(name.substr(0, end) + "_" + std::to_string(std::stoull(std::string(num.substr(1))) + 1));
     }
-
-    return sym(std::move(name));
+    return sym(name + suffix);
 }
 
 Defs World::reduce(const Var* var, const Def* arg) {
-    auto mut    = var->binder();
-    auto offset = mut->reduction_offset();
-    auto size   = mut->num_ops() - offset;
+    auto mut = var->binder();
+    auto off = mut->reduction_offset();
+    auto n   = mut->num_ops() - off;
+    auto ops = Defs(mut->ops().begin() + off, n);
+    // `[var -> var]` is the identity and so is a substitution without an occurrence.
+    if (var == arg || std::ranges::none_of(ops, [var](const Def* op) { return op->has_free_var(var); })) return ops;
 
-    if (auto i = move_.substs.find({var, arg}); i != move_.substs.end()) return i->second->defs();
+    auto reduct = this->reduct(var, arg);
+    auto rw     = VarRewriter(var, arg); // one rewriter for all slots: they share their sub-rewrites
+    for (size_t i = 0; i != n; ++i) {
+        auto& slot = reduct->ops()[i];
+        assert(slot != Filling && "op requires its own reduction");
+        if (slot) continue;
+        slot = Filling;
+        slot = rw.rewrite(ops[i]);
+    }
 
-    auto buf    = move_.arena.substs.allocate(sizeof(Reduct) + size * sizeof(const Def*), alignof(const Def*));
-    auto reduct = new (buf) Reduct(size);
-    auto rw     = VarRewriter(var, arg);
-    for (size_t i = 0; i != size; ++i)
-        reduct->defs_[i] = rw.rewrite(mut->op(i + offset));
-    assert_emplace(move_.substs, std::pair{var, arg}, reduct);
-    return reduct->defs();
+    return reduct->ops();
+}
+
+const Def* World::cached_reduct(const Var* var, const Def* arg, size_t i) {
+    auto mut = var->binder();
+    auto op  = mut->op(i + mut->reduction_offset());
+    if (var == arg || (op && !op->has_free_var(var))) return op;
+
+    if (auto it = move_.substs.find(std::pair{var, arg}); it != move_.substs.end())
+        if (auto slot = it->second->ops()[i]; slot != Filling) return slot;
+    return nullptr;
+}
+
+const Def* World::reduce(const Var* var, const Def* arg, size_t i) {
+    auto mut = var->binder();
+    auto off = mut->reduction_offset();
+    auto op  = mut->op(i + off);
+    if (var == arg) return op; // `[var -> var]` is the identity
+    if (!op) fe::throwf("cannot reduce `{}`: operand {} is not set", mut, i + off);
+    if (!op->has_free_var(var)) return op; // no occurrence: no Reduct, no VarRewriter
+
+    auto& slot = reduct(var, arg)->ops()[i];
+    assert(slot != Filling && "op requires its own reduction");
+    if (!slot) {
+        slot = Filling;
+        // If this ever bites performance, share one VarRewriter per Reduct and free it once all its slots are filled.
+        slot = VarRewriter(var, arg).rewrite(op);
+    }
+
+    return slot;
 }
 
 void World::for_each(bool elide_empty, std::function<void(Def*)> f, bool schedule /* = false */) {
-    unique_queue<MutSet> queue;
-    for (auto mut : externals().muts())
-        queue.push(mut);
+    auto keep = [elide_empty](Def* mut) { return mut->is_closed() && (!elide_empty || mut->is_set()); };
+    auto muts = fe::Vector<Def*>();
 
-    std::vector<Def*> muts;
-    while (!queue.empty()) {
-        auto mut = queue.pop();
-        if (mut && mut->is_closed() && (!elide_empty || mut->is_set())) muts.push_back(mut);
-
-        for (auto op : mut->deps())
-            for (auto mut : op->local_muts())
-                queue.push(mut);
-    }
-
-    // Schedules the mutables in post-order to ensure that they
-    // are emitted in the correct order of dependencies.
     if (schedule) {
-        const auto mut_nest = Nest(muts);
-        auto schedule       = Scheduler::schedule(mut_nest) | std::views::reverse | std::views::filter([&](Def* mut) {
-                            return mut->is_closed() && (!elide_empty || mut->is_set());
-                        });
-        for (auto* mut : schedule)
-            f(mut);
+        auto done = MutSet();
+        for (auto mut : externals().muts())
+            post_order(mut, done, muts, [](Def*) { return true; }, keep);
     } else {
-        for (auto* mut : muts)
-            f(mut);
+        auto queue = fe::BFSWorklist<MutSet>();
+        for (auto mut : externals().muts())
+            queue.push(mut);
+
+        while (!queue.empty()) {
+            auto mut = queue.pop();
+            if (keep(mut)) muts.emplace_back(mut);
+
+            for (auto op : mut->deps())
+                for (auto local_mut : op->local_muts())
+                    queue.push(local_mut);
+        }
     }
+
+    for (auto mut : muts)
+        f(mut);
 }
 
 /*
@@ -747,8 +1241,8 @@ void World::breakpoint(u32 gid) { state_.breakpoints.emplace(gid); }
 void World::watchpoint(u32 gid) { state_.watchpoints.emplace(gid); }
 
 const Def* World::gid2def(u32 gid) {
-    auto i = std::ranges::find_if(move_.defs, [=](auto def) { return def->gid() == gid; });
-    if (i == move_.defs.end()) return nullptr;
+    auto i = std::ranges::find_if(move_.sea, [=](auto def) { return def->gid() == gid; });
+    if (i == move_.sea.end()) return nullptr;
     return *i;
 }
 
@@ -757,24 +1251,28 @@ World& World::verify() {
         assert(mut->is_closed() && mut->is_set());
     for (auto anx : annexes().defs())
         assert(anx->is_closed());
+    assert(move_.levels.empty() && "postponed universe constraints must be solved via solve_levels");
     return *this;
 }
 
 #endif
 
 #ifndef DOXYGEN
-template const Def* World::umax<UMax::Term>(Defs);
-template const Def* World::umax<UMax::Type>(Defs);
-template const Def* World::umax<UMax::Kind>(Defs);
-template const Def* World::umax<UMax::Univ>(Defs);
 template const Def* World::ext<true>(const Def*);
 template const Def* World::ext<false>(const Def*);
-template const Def* World::bound<true>(Defs);
-template const Def* World::bound<false>(Defs);
 template const Def* World::app<true>(const Def*, const Def*);
 template const Def* World::app<false>(const Def*, const Def*);
 template const Def* World::implicit_app<true>(const Def*, const Def*);
 template const Def* World::implicit_app<false>(const Def*, const Def*);
 #endif
+
+// Interning here - once per push - instead of in unify() keeps ~170k redundant Driver::dbg lookups per compile
+// off the hot path: only a few thousand distinct Loc%s occur, yet every emitted Def wants one.
+// Restore rolls both fields back together, so popping a scope never re-interns either.
+World::ScopedLoc World::push(Loc loc) {
+    auto& curr = state_.pod.curr_loc;
+    if (loc == curr.loc) return ScopedLoc(curr); // nested emitters push the same Loc; don't re-intern it
+    return ScopedLoc(curr, {loc, loc ? driver().dbg(Dbg(loc)) : DbgKey()});
+}
 
 } // namespace mim

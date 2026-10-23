@@ -1,9 +1,10 @@
-// RUN: rm -f %{s:stem}.ll ; \
-// RUN: %mim -p opt %s -p ll -o -
-
-// TODO: add filecheck
+// RUN: %mim -p opt %s -p ll -X ll:o=%t.ll
+// RUN: %FileCheck %s < %t.ll
 
 plugin core;
+plugin mem;
+
+use core.ops.u.w;
 
 let Tas = (I32, 0);
 
@@ -12,52 +13,66 @@ let Tas = (I32, 0);
 // Therefore, we need to handle them explicitely.
 // As such functions prevent code gen, we want to ignore the extern flag.
 
-con extern f1 [mem: %mem.M 0, a: I32, return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con f1 (m: mem.M 0, a: I32, return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern f2 [[mem: %mem.M 0, a: I32], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con f2 ((m: mem.M 0, a: I32), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern g1 [mem: %mem.M 0, a: I32, b:I32, return: Cn [%mem.M 0, I32]] =
-    let c = %core.wrap.add 0 (a,b);
-    return (mem,c);
+extern con g1 (m: mem.M 0, a b: I32, return: Cn [mem.M 0, I32]) =
+    let c = a + b;
+    return (m, c);
 
-con extern g2 [[mem: %mem.M 0, a: I32, b:I32], return: Cn [%mem.M 0, I32]] =
-    let c = %core.wrap.add 0 (a,b);
-    return (mem,c);
+extern con g2 ((m: mem.M 0, a b: I32), return: Cn [mem.M 0, I32]) =
+    let c = a + b;
+    return (m, c);
 
-con extern g3 [[mem: %mem.M 0, [a: I32, b:I32]], return: Cn [%mem.M 0, I32]] =
-    let c = %core.wrap.add 0 (a,b);
-    return (mem,c);
+extern con g3 ((m: mem.M 0, (a b: I32)), return: Cn [mem.M 0, I32]) =
+    let c = a + b;
+    return (m, c);
 
-con extern g4 [mem: %mem.M 0, [a: I32, b:I32], return: Cn [%mem.M 0, I32]] =
-    let c = %core.wrap.add 0 (a,b);
-    return (mem,c);
+extern con g4 (m: mem.M 0, (a b: I32), return: Cn [mem.M 0, I32]) =
+    let c = a + b;
+    return (m, c);
 
-con extern h1 [mem: %mem.M 0, a: I32, x:%mem.Ptr (I32, 0), return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con h1 (m: mem.M 0, a: I32, x: mem.Ptr (I32, 0), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern h2 [mem: %mem.M 0, [a: I32, x:%mem.Ptr (I32, 0)], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con h2 (m: mem.M 0, (a: I32, x: mem.Ptr (I32, 0)), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern h3 [[mem: %mem.M 0, a: I32, x:%mem.Ptr (I32, 0)], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con h3 ((m: mem.M 0, a: I32, x: mem.Ptr (I32, 0)), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern h4 [[mem: %mem.M 0, [a: I32, x:%mem.Ptr (I32, 0)]], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con h4 ((m: mem.M 0, (a: I32, x: mem.Ptr (I32, 0))), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern e1 [mem: %mem.M 0, a: I32, [], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con e1 (m: mem.M 0, a: I32, (), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern e2 [mem: %mem.M 0, [a: I32, []], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con e2 (m: mem.M 0, (a: I32, ()), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern e3 [[mem: %mem.M 0, [a: I32, []]], return: Cn [%mem.M 0, I32]] =
-    return (mem,a);
+extern con e3 ((m: mem.M 0, (a: I32, ())), return: Cn [mem.M 0, I32]) =
+    return (m, a);
 
-con extern main [mem : %mem.M 0, argc : I32, argv : %mem.Ptr (%mem.Ptr (I8, 0), 0), return : Cn [%mem.M 0, I32]] =
-    let (mem2,p) = %mem.alloc Tas mem;
-    // let mem3 = %mem.store Tas (mem2, p, argc);
+extern con main (m: mem.M 0, argc: I32, argv: mem.Ptr («core.idx2nat argc; mem.Ptr (mem.Char, 0)», 0), return: Cn [mem.M 0, I32]) =
+    let (m, p) = mem.alloc Tas m;
+    // let mem = mem.store Tas (mem, p, argc);
 
-    // con extern cont_f1 (mem:%mem.M 0, v:I32) = f1 ();
-    return (mem2, argc);
+    // extern con cont_f1 (mem:mem.M 0, v:I32) = f1 ();
+    return (m, argc);
+
+// CHECK-DAG: define i32 @e1(i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @e2(i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @e3(i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @f1(i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @f2(i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @g1(i32 %{{[^,]+}}, i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @g2(i32 %{{[^,]+}}, i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @g3(i32 %{{[^,]+}}, i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @g4(i32 %{{[^,]+}}, i32 %{{[^,]+}})
+// CHECK-DAG: define i32 @h1(i32 %{{[^,]+}}, i32 addrspace(0)* %{{[^,]+}})
+// CHECK-DAG: define i32 @h2(i32 %{{[^,]+}}, i32 addrspace(0)* %{{[^,]+}})
+// CHECK-DAG: define i32 @h3(i32 %{{[^,]+}}, i32 addrspace(0)* %{{[^,]+}})
+// CHECK-DAG: define i32 @h4(i32 %{{[^,]+}}, i32 addrspace(0)* %{{[^,]+}})

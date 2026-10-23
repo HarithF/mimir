@@ -1,33 +1,33 @@
 // RUN: %mim -p opt %s -o - | %FileCheck %s
 
-// The inner map_reduce performs a reduction (sums along an axis), so its value at any
-// position requires a loop. The fuse phase must NOT fuse it into the outer pure map.
-plugin tensor;
+// The inner map_reduce performs a reduction (sums along an axis), so its value at any position
+// requires a loop and must NOT be inlined into the outer's combiner. The outer is a pure map, but
+// it reads the reduction through a broadcast (its access map ignores the j loop), so composing it
+// into the inner's epilogue would rerun the whole reduction once per broadcast copy — the epilogue
+// direction must not fire either. Both map_reduces remain.
+plugin tensor as *;
 plugin core;
-plugin opt;
+plugin affine;
+plugin compile;
 
-lam add1 (x: Nat): Nat = %core.nat.add (x, 1);
+use core.ops.n;
 
-fun sum_reduce (acc x: Nat)@tt: Nat = return (%core.nat.add (acc, x));
-
-con extern f [v: «2; «3; Nat»», return: Cn «2; Nat»] =
+extern con f (v: «2; «3; Nat»», return: Cn «2, 2; Nat») =
+    let v = buf v;
     // inner[i] = Σ_j v[i, j]: one output loop (bound 2), one reduction loop (bound 3)
-    let inner = %tensor.map_reduce @1 @(Nat, 1, 1) (2, (2, 3)) @(Nat, 2, (2, 3)) (sum_reduce, 0)
-        (%tensor.proj_map @(2, 1) 0)
-        (%tensor.proj_map @(2, 2) (0, 1),)
-        v;
-    // outer[i] = inner[i] + 1    (pure map)
-    let outer = %tensor.unary @(Nat, Nat) add1 @(1, 2) inner;
+    let inner = map_reduce (2, (2, 3)) (fn (acc x: Nat)@tt = return (acc + x), 0) (proj_map 0) (proj_map (0, 1)) v;
+    // outer[i, j] = inner[i] + 1    (pure map, broadcast read)
+    let outer = map_reduce ((2, 2), (2, 2)) (fn (acc y: Nat)@tt = return (y + 1), 0) (affine.id) (lm (i j: affine.Index) = i) inner;
     return outer;
 
-lam extern _compile (): %compile.Phase =
-    %compile.phases ff (
-        %compile.internal_cleanup,
-        %tensor.lower_tensor,
-        %tensor.fuse_tensor,
-        %compile.internal_cleanup,
+extern lam _compile (): compile.Phase =
+    compile.phases ff (
+        compile.cleanup,
+        lower_tensor,
+        fuse_tensor,
+        compile.cleanup,
     );
 
-// Two %tensor.map_reduce operations must remain, since the inner has a reduction.
-// CHECK: %tensor.map_reduce
-// CHECK: %tensor.map_reduce
+// Two tensor.map_reduce operations must remain, since the inner has a reduction.
+// CHECK: tensor.map_reduce
+// CHECK: tensor.map_reduce

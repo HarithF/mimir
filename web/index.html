@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MimIR Playground</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="playground.css">
+<link rel="stylesheet" href="code.css">
+<!-- Stamps `dark-mode`/`light-mode` on <html> before the first paint, so load it here rather than at the end. -->
+<script src="darkmode-toggle.js"></script>
+</head>
+<body>
+<header>
+    <h1><a href="https://mimir.github.io/" title="MimIR"><img src="logo.svg" alt="MimIR"></a>MimIR Playground</h1>
+    <select id="examples" title="Load an example"></select>
+    <label><input type="checkbox" id="optimize" checked><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>optimize</label>
+    <button id="run"><svg class="icon fill" viewBox="0 0 24 24" aria-hidden="true"><path class="play" d="M7 4v16l13-8z"/><rect class="stop" x="6" y="6" width="12" height="12" rx="1.5"/></svg><span>Compile</span></button>
+    <span class="spacer"></span>
+    <span id="status">loading…</span>
+    <doxygen-awesome-dark-mode-toggle id="theme" title="Toggle Light/Dark Mode"></doxygen-awesome-dark-mode-toggle>
+</header>
+
+<main>
+    <div id="editor">
+        <div id="editor-bar">
+            <label title="vi keybindings; `:w` compiles."><input type="checkbox" id="vi"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7 16h10"/></svg>vi</label>
+            <button id="share" title="Copies a link to this program to your clipboard."><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg><span>Share</span></button>
+        </div>
+        <textarea id="source" spellcheck="false"></textarea>
+    </div>
+
+    <div id="right">
+        <div id="tabs" role="tablist">
+            <button role="tab" data-pane="log"   aria-selected="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 17 6-5-6-5M12 19h8"/></svg>Log</button>
+            <button role="tab" data-pane="ast"   aria-selected="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 6H8M21 12h-8M21 18h-8M3 6v4a2 2 0 0 0 2 2h3M3 10v6a2 2 0 0 0 2 2h3"/></svg>AST</button>
+            <button role="tab" data-pane="mim"   aria-selected="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h3l10 16M12.5 11.5 6 20"/></svg>Mim</button>
+            <button role="tab" data-pane="graph" aria-selected="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.5 6h7M7.2 8.2l3.6 7.6M16.8 8.2l-3.6 7.6"/></svg>Graph</button>
+            <button role="tab" data-pane="nest"  aria-selected="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M10.9 8.2l-3.8 7.6M13.1 8.2l3.8 7.6"/></svg>Nest</button>
+            <button role="tab" data-pane="ll"    aria-selected="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M19 5 5 19"/></svg>LLVM</button>
+        </div>
+        <div id="panes">
+            <div class="pane" id="pane-log"  hidden><pre></pre></div>
+            <div class="pane" id="pane-ast"  hidden><pre></pre></div>
+            <div class="pane" id="pane-mim"  hidden>
+                <div class="opts" id="mim-opts">
+                    <label title="Uses ASCII alternatives instead of UTF-8 throughout the output."><input type="checkbox" id="ascii"> ASCII</label>
+                    <label title="Ascribes the type of each `let`-bound name; it is inferable from the right-hand side and hence elided by default."><input type="checkbox" data-mim="typed-let"> typed lets</label>
+                </div>
+                <pre></pre>
+            </div>
+            <div class="pane" id="pane-graph">
+                <div class="opts" id="dot-opts">
+                    <label title="Always shows a lambda's filter - even if it is the default one (`ff` for continuations, `tt` for direct-style functions)."><input type="checkbox" data-dot="default-filter"> default filter</label>
+                    <label title="Follows type dependencies."><input type="checkbox" data-dot="follow-types"> type edges</label>
+                    <label title="Wires up literals, axioms, etc. with normal edges instead of detaching them into a separate row; useful for small graphs."><input type="checkbox" data-dot="inline-consts"> inline consts</label>
+                    <label title="Renders otherwise-transparent detached edges - back-edges from a Var to its binder, shared literals/axioms, and type edges - in a subtle gray."><input type="checkbox" data-dot="show-hidden"> hidden edges</label>
+                    <label title="Drops the tooltip a node shows on hover - two fifths of the DOT."><input type="checkbox" data-dot="no-tooltip"> no tooltips</label>
+                    <label title="Labels a node `Node name_gid` instead of the boxed two-line label. Another third off the DOT, at the cost of the ports an edge docks at."><input type="checkbox" data-dot="lean-labels"> lean labels</label>
+                </div>
+                <div class="graph" id="graph" tabindex="0"></div>
+            </div>
+            <div class="pane" id="pane-nest" hidden>
+                <div class="graph" id="nest" tabindex="0"></div>
+            </div>
+            <div class="pane" id="pane-ll"   hidden><pre></pre></div>
+        </div>
+    </div>
+</main>
+
+<!-- Defines the lexers the docs colour their snippets with; Code.init() is not used here. -->
+<script src="code.js"></script>
+<script src="mim-code.js"></script>
+<script src="llvm-code.js"></script>
+<script src="share-link.js"></script>
+<script type="module" src="playground.js"></script>
+</body>
+</html>

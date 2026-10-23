@@ -10,24 +10,18 @@
 #include <mim/plug/cps/cps.h>
 #include <mim/plug/mem/mem.h>
 
-#include "mim/plug/regex/autogen.h"
 #include "mim/plug/regex/dfa2matcher.h"
+#include "mim/plug/regex/regex.h"
 #include "mim/plug/regex/regex2nfa.h"
 
-// clang-format off
+#ifndef DOXYGEN // clang-format off
 template<> struct std::formatter<automaton::DFA> : fe::ostream_formatter {};
 template<> struct std::formatter<automaton::NFA> : fe::ostream_formatter {};
-// clang-format on
+#endif // clang-format on
 
 namespace mim::plug::regex {
 
-namespace {
-const Def* wrap_in_cps2ds(const Def* callee) { return cps::op_cps2ds_dep(callee); }
-} // namespace
-
 const Def* LowerRegex::rewrite_imm_App(const App* app) {
-    if (is_bootstrapping()) return RWPhase::rewrite_imm_App(app);
-
     auto callee = app->callee();
     if (Axm::isa<regex::conj>(callee) || Axm::isa<regex::disj>(callee) || Axm::isa<regex::not_>(callee)
         || Axm::isa<regex::neg_lookahead>(callee) || Axm::isa<regex::range>(callee) || Axm::isa<regex::any>(callee)
@@ -35,13 +29,13 @@ const Def* LowerRegex::rewrite_imm_App(const App* app) {
         // The NFA is derived from the old callee's structure; only the argument needs rewriting.
         auto new_n = rewrite(app->arg());
         auto nfa   = regex2nfa(callee);
-        DLOG("nfa: {}", *nfa);
+        log().d("NFA: {}", *nfa);
 
         auto dfa = automaton::nfa2dfa(*nfa);
-        DLOG("dfa: {}", *dfa);
+        log().d("DFA: {}", *dfa);
 
         auto min_dfa = automaton::minimize_dfa(*dfa);
-        return wrap_in_cps2ds(dfa2matcher(new_world(), *min_dfa, new_n));
+        return cps::op_cps2ds_dep(dfa2matcher(new_world(), *min_dfa, new_n));
     }
 
     return RWPhase::rewrite_imm_App(app);

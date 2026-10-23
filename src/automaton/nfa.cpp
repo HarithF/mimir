@@ -6,12 +6,7 @@
 
 namespace automaton {
 
-void NFANode::add_transition(const NFANode* to, std::uint16_t c) {
-    if (auto it = transitions_.find(c); it != transitions_.end())
-        it->second.push_back(to);
-    else
-        transitions_.try_emplace(c, std::vector<const NFANode*>{to});
-}
+void NFANode::add_transition(const NFANode* to, std::uint16_t c) { transitions_[c].push_back(to); }
 
 std::vector<const NFANode*> NFANode::get_transitions(std::uint16_t c) const {
     if (erroring_) return {};
@@ -24,7 +19,7 @@ std::vector<const NFANode*> NFANode::get_transitions(std::uint16_t c) const {
 
 template class AutomatonBase<NFANode>;
 
-std::ostream& operator<<(std::ostream& os, const NFANode& node) {
+void NFANode::print(std::ostream& os) const {
     auto print_char = [](std::uint16_t c) -> std::string {
         if (c == NFA::SpecialTransitons::EPSILON)
             return "ε";
@@ -33,7 +28,7 @@ std::ostream& operator<<(std::ostream& os, const NFANode& node) {
         return std::to_string(c);
     };
 
-    return print_node(os, node, std::move(print_char));
+    print_node(os, *this, print_char);
 }
 
 } // namespace automaton

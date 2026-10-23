@@ -1,6 +1,6 @@
 #pragma once
 
-#include <absl/container/flat_hash_set.h>
+#include <ankerl/unordered_dense.h>
 
 #include "mim/def.h"
 
@@ -39,8 +39,6 @@ public:
     Hole* unset() { return Def::unset()->as<Hole>(); }
     ///@}
 
-    Hole* stub(const Def* type) { return stub_(world(), type)->set(dbg()); }
-
     /// If unset, explode to Tuple.
     /// @returns the new Tuple, or `this` if unsuccessful.
     const Def* tuplefy(nat_t);
@@ -71,16 +69,13 @@ public:
     static constexpr size_t Num_Ops = 1;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-    Hole* stub_(World&, const Def*) final;
-
     friend class World;
-    friend class Checker;
+    friend class Check;
 };
 
-class Checker {
+class Check {
 public:
-    explicit Checker(World& world)
+    explicit Check(World& world)
         : world_(world) {}
 
     World& world() { return world_; }
@@ -88,23 +83,31 @@ public:
     enum Mode {
         /// In Mode::Check, type inference is happening and Hole%s will be resolved, if possible.
         /// Also, two *free* but *different* Var%s **are** considered α-equivalent.
-        Check,
+        C,
         /// In Mode::Test, no type inference is happening and Hole%s will not be touched.
         /// Also, Two *free* but *different* Var%s are **not** considered α-equivalent.
-        Test,
+        T,
     };
 
-    template<Mode mode>
+    template<Mode mode = C>
     static bool alpha(const Def* d1, const Def* d2) {
         if (d1 == d2) return true;
-        return Checker(d1->world()).alpha_<mode>(d1, d2);
+        auto checker = Check(d1->world());
+        if (!checker.alpha_<mode>(d1, d2)) return false;
+        checker.commit();
+        return true;
     }
+
+    static bool test_alpha(const Def* d1, const Def* d2) { return alpha<T>(d1, d2); }
 
     /// Can @p value be assigned to sth of @p type?
     /// @note This is different from `equiv(type, value->type())` since @p type may be dependent.
-    [[nodiscard]] static const Def* assignable(const Def* type, const Def* value) {
+    [[nodiscard]] static const Def* coerce(const Def* type, const Def* value) {
         if (type == value->type()) return value;
-        return Checker(type->world()).assignable_(type, value);
+        auto checker = Check(type->world());
+        auto res     = checker.coerce_(type, value);
+        if (res) checker.commit();
+        return res;
     }
 
     /// Yields `defs.front()`, if all @p defs are Check::alpha-equivalent (`Mode::Test`) and `nullptr` otherwise.
@@ -123,33 +126,44 @@ private:
     const Def* fail() { return {}; }
 #endif
 
-    [[nodiscard]] const Def* assignable_(const Def* type, const Def* value);
+    [[nodiscard]] const Def* coerce_(const Def* type, const Def* value);
     template<Mode>
     [[nodiscard]] bool alpha_(const Def* d1, const Def* d2);
     template<Mode>
     [[nodiscard]] bool alpha_impl_(const Def* d1, const Def* d2);
+
+    /// Fast path for alpha_ that needs neither binders_ nor memo_ and hence doesn't allocate.
+    /// @returns `std::nullopt`, if the full alpha_impl_ machinery is needed.
+    template<Mode>
+    [[nodiscard]] std::optional<bool> try_alpha_(const Def* d1, const Def* d2);
+
     template<Mode>
     [[nodiscard]] bool check(const Prod*, const Def*);
     template<Mode>
-    [[nodiscard]] bool check(const Seq*, const Def*);
+    [[nodiscard]] bool check(const Seq*, const Seq*);
+    [[nodiscard]] bool check(Hole*, const Def*);
+    [[nodiscard]] bool check_rank(const Seq*, Hole* rank, const Def*);
     [[nodiscard]] bool check1(const Seq*, const Def*);
     [[nodiscard]] bool check(Seq*, const Seq*);
-    [[nodiscard]] bool check(const UMax*, const Def*);
+    [[nodiscard]] bool check(const LMax*, const Def*);
+    [[nodiscard]] bool check(const LSucc*, const Def*);
+    void commit(); ///< Hands deferred_ over to World::postpone once the whole check has succeeded.
 
-    auto bind(Def* mut, const Def* d) {
-        if (!mut) return std::pair(binders_.end(), true);
-        auto res = binders_.emplace(mut, d);
-        // A new binding may change how bound Var%s compare, so positive memo entries may become invalid.
-        if (res.second) {
-            memo_[Check].clear();
-            memo_[Test].clear();
-        }
-        return res;
+    /// Symmetric key for the alpha_ memo: the two gids packed into one u64, smaller first.
+    /// Canonicalizing by gid is what lets alpha_ get away with a single probe.
+    static constexpr u64 memo_key(const Def* d1, const Def* d2) noexcept {
+        auto g1 = u64(d1->gid()), g2 = u64(d2->gid());
+        return g1 < g2 ? g1 << 32 | g2 : g2 << 32 | g1;
     }
 
+    using Binders = MutMap<const Def*>;
+    std::pair<Binders::iterator, bool> bind(Def* mut, const Def* d);
+
     World& world_;
-    MutMap<const Def*> binders_;
-    std::array<absl::flat_hash_set<std::pair<const Def*, const Def*>>, 2> memo_;
+    Binders binders_;
+    Vars bound_; ///< Var%s of all binders_; these are the Var%s subject to renaming.
+    std::array<ankerl::unordered_dense::set<u64>, 2> memo_;
+    fe::Vector<std::pair<const LMax*, const Def*>> deferred_;
 };
 
 } // namespace mim

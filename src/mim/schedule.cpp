@@ -1,6 +1,7 @@
 #include "mim/schedule.h"
 
-#include <queue>
+#include <fe/container.h>
+#include <fe/worklist.h>
 
 #include "mim/world.h"
 
@@ -8,24 +9,20 @@ namespace mim {
 
 Scheduler::Scheduler(const Nest& nest)
     : nest_(&nest) {
-    std::queue<const Def*> queue;
-    DefSet done;
+    auto queue = fe::BFSWorklist<DefSet>();
 
     auto enqueue = [&](const Def* def, size_t i, const Def* op) {
         if (nest.contains(op)) {
-            assert_emplace(def2uses_[op], def, i);
-            if (auto [_, ins] = done.emplace(op); ins) queue.push(op);
+            fe::assert_emplace(def2uses_[op], def, i);
+            queue.push(op);
         }
     };
 
-    for (auto mut : nest.muts()) {
-        queue.push(mut);
-        assert_emplace(done, mut);
-    }
+    for (auto mut : nest.muts())
+        if (mut) queue.push(mut);
 
     while (!queue.empty()) {
-        auto def = queue.front();
-        queue.pop();
+        auto def = queue.pop();
 
         if (!def->is_set()) continue;
 
@@ -40,7 +37,7 @@ Scheduler::Scheduler(const Nest& nest)
 }
 
 const Nest::Node* Scheduler::early(const Def* def) {
-    if (auto i = early_.find(def); i != early_.end()) return i->second;
+    if (auto n = fe::lookup(early_, def)) return n;
     if (def->is_closed() || !nest().contains(def)) return early_[def] = nest().root();
     if (auto var = def->isa<Var>()) return early_[def] = nest()[var->binder()];
 
@@ -56,7 +53,7 @@ const Nest::Node* Scheduler::early(const Def* def) {
 }
 
 const Nest::Node* Scheduler::late(Def* curr_mut, const Def* def) {
-    if (auto i = late_.find(def); i != late_.end()) return i->second;
+    if (auto n = fe::lookup(late_, def)) return n;
     if (def->is_closed() || !nest().contains(def)) return late_[def] = nest().root();
 
     const Nest::Node* result = nullptr;
@@ -77,7 +74,7 @@ const Nest::Node* Scheduler::late(Def* curr_mut, const Def* def) {
 }
 
 const Nest::Node* Scheduler::smart(Def* curr_mut, const Def* def) {
-    if (auto i = smart_.find(def); i != smart_.end()) return i->second;
+    if (auto n = fe::lookup(smart_, def)) return n;
 
     auto e = early(def);
     auto l = late(curr_mut, def);
@@ -88,7 +85,7 @@ const Nest::Node* Scheduler::smart(Def* curr_mut, const Def* def) {
         i = i->inest();
 
         if (i == nullptr) {
-            world().ELOG("this should never occur - don't know where to put {}", def);
+            world().log().e("no place found for {}", def);
             s = l;
             break;
         }
@@ -102,30 +99,19 @@ const Nest::Node* Scheduler::smart(Def* curr_mut, const Def* def) {
     return smart_[def] = s;
 }
 
-static void post_order(const Nest& nest, const Nest::Node* node, Scheduler::Schedule& res, MutSet& done) {
-    // The mut of a virtual root is a nullptr
-    if (!node->mut()) {
-        for (auto child : node->children().nodes())
-            post_order(nest, child, res, done);
-        return;
-    }
-
-    if (!node->mut()->isa<Lam>()) return;
-    if (auto [_, ins] = done.emplace(node->mut()); !ins) return;
-
-    for (auto op : node->mut()->deps()) {
-        for (auto mut : op->local_muts())
-            if (auto next = nest[mut]) post_order(nest, next, res, done);
-    }
-
-    res.emplace_back(node->mut());
-}
-
 // until we have sth better ...
 Scheduler::Schedule Scheduler::schedule(const Nest& nest) {
-    Schedule schedule;
-    MutSet done;
-    post_order(nest, nest.root(), schedule, done);
+    auto in_nest  = [&nest](Def* mut) { return nest[mut] != nullptr; };
+    auto done     = MutSet();
+    auto schedule = Schedule();
+
+    // The mut of a virtual root is a nullptr.
+    if (auto root = nest.root()->mut())
+        post_order(root, done, schedule, in_nest, in_nest);
+    else
+        for (auto mut : nest.root()->children().muts())
+            post_order(mut, done, schedule, in_nest, in_nest);
+
     std::ranges::reverse(schedule); // post-order → reverse post-order
     return schedule;
 }

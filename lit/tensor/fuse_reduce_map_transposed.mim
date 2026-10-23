@@ -1,0 +1,32 @@
+// RUN: %mim -p opt %s -o - | %FileCheck %s
+
+// The outer reduction reads the inner pure map through a transposed access map (j, i).
+// The permutation still covers every loop index — the read is injective — so the fuse phase
+// must collapse the two ops: out[i] = Σ_j (v[j, i] + 1).
+plugin core;
+plugin tensor;
+plugin compile;
+
+use core.ops.n;
+use tensor;
+
+lam add1 (x: Nat): Nat = x + 1;
+
+fun sum_reduce (acc x: Nat)@tt: Nat = return (acc + x);
+
+extern con f (v: «3; «2; Nat»», return: Cn «2; Nat») =
+    let v = buf v;
+    let inner = unary add1 v;
+    return (map_reduce (2, (2, 3)) (sum_reduce, 0)
+        (proj_map 0) (proj_map (1, 0)) inner);
+
+extern lam _compile (): compile.Phase =
+    compile.phases ff (
+        compile.cleanup,
+        lower_tensor,
+        fuse_tensor,
+        compile.cleanup,
+    );
+
+// CHECK: tensor.map_reduce
+// CHECK-NOT: tensor.map_reduce

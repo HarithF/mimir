@@ -4,7 +4,7 @@
 #include <memory>
 #include <utility>
 
-#include <absl/container/fixed_array.h>
+#include <fe/bitset.h>
 
 #include "mim/driver.h"
 #include "mim/flags.h"
@@ -20,6 +20,27 @@ Phase::Phase(World& world, flags_t annex)
     , annex_(annex)
     , name_(world.annex(annex)->sym()) {}
 
+const fe::Vector<std::string>& Phase::args() { return driver().args(Annex::demangle(Annex::flags2plugin(annex_))); }
+
+std::unique_ptr<Phase> Phase::create(const Flags2Phases& phases, const Def* def) {
+    auto& world = def->world();
+    auto p_def  = App::uncurry_callee(def);
+    world.log().d("apply phase {}", p_def);
+
+    if (auto axm = p_def->isa<Axm>())
+        if (auto i = phases.find(axm->flags()); i != phases.end()) {
+            auto phase = i->second(world);
+            if (phase) {
+                phase->apply(def->isa<App>());
+                if (phase->redirects()) return phase->take_resolved();
+            }
+            return phase;
+        } else
+            fe::throwf("no phase registered for stage `{}`; is its plugin loaded?", axm->sym());
+    else
+        fe::throwf("unsupported callee for a phase: `{}`", p_def);
+}
+
 std::unique_ptr<Phase> Phase::recreate() {
     auto ctor = driver().phase(annex());
     auto ptr  = (*ctor)(world());
@@ -30,9 +51,9 @@ std::unique_ptr<Phase> Phase::recreate() {
 void Phase::run() {
     auto profiling = driver().flags().profile != Flags::Profile::None;
     if (profiling) driver().profiler().start(name());
-    world().verify().ILOG("🚀 Phase launch: `{}`", name());
+    world().verify().log().i("🚀 launch phase `{}`", name());
     start();
-    world().verify().ILOG("🏁 Phase finish: `{}`", name());
+    world().verify().log().i("🏁 finish phase `{}`", name());
     if (profiling) driver().profiler().stop();
 }
 
@@ -45,27 +66,31 @@ void Phase::profile_count(std::string_view key, uint64_t n) {
  */
 
 void Analysis::reset() {
-    old2news_.clear();
+    scopes_.clear();
     worklist_.clear();
     push();
     todo_ = false;
 }
 
 void Analysis::start() {
+    auto _ = world().lenient();
+
     curr_sparse_ = !dense_ && !nonlocal_ && !dirty_.empty();
     nonlocal_    = false;
-    auto seeds   = Vector<Def*>(dirty_.begin(), dirty_.end());
+    auto seeds   = fe::Vector<Def*>(dirty_.begin(), dirty_.end());
     dirty_.clear();
 
     prepare();
 
     if (curr_sparse_) {
-        VLOG("sparse round: re-draining {} dirty muts", seeds.size());
+        log().v("sparse round: re-drain {} dirty muts", seeds.size());
         std::ranges::sort(seeds, GIDLt<Def*>()); // MutSet iteration order is nondeterministic
 
-        // Replay the lattice into the fresh rewriter map: this re-installs the substitutions that
-        // non-revisited producers wrote in earlier rounds - except for mutables, whose map entry
-        // doubles as the per-round "already scheduled" marker and would suppress their drain.
+        // Pre-install what earlier rounds substituted, so this round prunes everything they already settled -
+        // except for mutables, whose map entry doubles as the per-round "already scheduled" marker and would
+        // suppress their drain. Pruning skips rewrite hooks, which is why only a sparse round does it: the
+        // full round that certifies the fixed point always re-derives from the program.
+        old2new().reserve(lattice_.size());
         for (auto [concr, abstr] : lattice_)
             if (!concr->isa_mut()) map(concr, abstr);
 
@@ -73,12 +98,6 @@ void Analysis::start() {
             rewrite(mut);
         drain();
     } else {
-        for (const auto& [flags, e] : world().annexes())
-            rewrite_annex(flags, e.sym, e.def);
-        drain();
-
-        bootstrapping_ = false;
-
         for (auto mut : world().externals().muts())
             rewrite_external(mut);
         drain();
@@ -94,14 +113,54 @@ void Analysis::start() {
     if (curr_sparse_ && !todo()) invalidate();
 }
 
-void Analysis::rewrite_annex(flags_t, Sym, const Def* def) { rewrite(def); }
 void Analysis::rewrite_external(Def* mut) { rewrite(mut); }
 
-Def* Analysis::rewrite_mut(Def* mut) {
+const Def* Analysis::lookup(const Def* def) {
+    if (auto res = Rewriter::lookup(def)) return res;
+    return world().annexes().opaque(def) ? def : nullptr;
+}
+
+bool Analysis::lattice_force(const Def* concr, const Def* abstr) {
+    if (is_singleton(concr)) return false;
+    map(concr, abstr);
+
+    if (auto [i, ins] = lattice_.emplace(concr, abstr); !ins) {
+        if (i->second == abstr) return false;
+        i->second = abstr;
+    }
+    return touch(), true;
+}
+
+bool Analysis::lattice(const Def* concr, const Def* abstr) {
+    if (is_singleton(concr)) return false;
+    map(concr, abstr);
+
+    if (auto [i, ins] = lattice_.emplace(concr, abstr); !ins) {
+        assert((i->second != concr || abstr == concr) && "monotonicity violation: must not descend from ⊤");
+        if (i->second == abstr) return false;
+        i->second = abstr;
+    } else if (concr == abstr) {
+        return false;
+    }
+    return touch(), true;
+}
+
+bool Analysis::is_cyclic(const Def* def) const {
+    auto slow = follow(def), fast = follow(slow);
+    for (; slow != fast; slow = follow(slow), fast = follow(follow(fast))) {}
+    return follow(fast) != fast;
+}
+
+const Def* Analysis::rewrite(const Def* def) {
+    if (def->isa_mut()) return Rewriter::rewrite(def);
+    return repr(Rewriter::rewrite(def));
+}
+
+const Def* Analysis::rewrite_mut(Def* mut) {
     if (lookup(mut)) return mut; // already scheduled this round
     map(mut, mut);
     worklist_.emplace_back(mut);
-    return mut;
+    return Rewriter::rewrite_mut(mut);
 }
 
 void Analysis::drain() {
@@ -111,9 +170,10 @@ void Analysis::drain() {
         ++num_drained_;
 
         auto _ = enter(mut);
-        DLOG("enter: {}", mut);
+        log().d("enter {}", mut);
         for (auto d : mut->deps())
             rewrite(d);
+        leave();
     }
 }
 
@@ -125,18 +185,16 @@ void RWPhase::start() {
     auto max_iters = driver().flags().max_fp_iters;
     bool todo      = true;
     for (uint32_t i = 0; todo; ++i) {
-        if (i >= max_iters) error("phase `{}` did not reach a fixed point after {} iterations", name(), max_iters);
-        VLOG("iteration: {}", i);
+        if (i >= max_iters) fe::throwf("phase `{}` did not reach a fixed point after {} iterations", name(), max_iters);
+        log().v("iteration {}", i);
         todo = analyze();
     }
 
-    for (const auto& [flags, e] : old_world().annexes())
-        rewrite_annex(flags, e.sym, e.def);
-
-    bootstrapping_ = false;
-
+    auto gid = new_world().curr_gid();
     for (auto mut : old_world().externals().muts())
         rewrite_external(mut);
+    finalize();
+    profile_count("rw.defs", new_world().curr_gid() - gid);
 
     swap(old_world(), new_world());
 }
@@ -151,11 +209,110 @@ bool RWPhase::analyze() {
     return false;
 }
 
-void RWPhase::rewrite_annex(flags_t f, Sym sym, const Def* def) { new_world().annexes().attach(f, sym, rewrite(def)); }
+const Def* RWPhase::lookup(const Def* old_def) {
+    if (auto new_def = Rewriter::lookup(old_def)) return new_def;
+    if (auto flags = old_world().annexes().opaque(old_def)) return map(old_def, new_world().annex(*flags));
+    return nullptr;
+}
 
 void RWPhase::rewrite_external(Def* old_mut) {
-    auto new_mut = rewrite(old_mut)->as_mut();
-    if (old_mut->is_external()) new_mut->externalize();
+    // A phase may have externalized the new mutable itself already, or replaced it by an immutable.
+    if (auto new_mut = rewrite(old_mut)->isa_mut(); new_mut && !new_mut->is_external()) new_mut->externalize();
+}
+
+const Def* RWPhase::rewrite_imm_App(const App* app) {
+    // The arg goes first for the same reason as in Rewriter::rewrite_imm_App.
+    auto arg    = rewrite(app->arg());
+    auto callee = rewrite(app->callee());
+    if (auto pi = callee->isa_type<Pi>()) arg = coerce(pi->dom(), arg);
+    return new_world().app(callee, arg);
+}
+
+/// Is @p tuple%'s type what World::tuple would infer from its ops?
+static bool has_inferred_type(const Tuple* tuple) {
+    auto& w = tuple->world();
+    return !w.is_frozen() && tuple->type() == Tuple::infer(w, tuple->ops());
+}
+
+const Def* RWPhase::rewrite_imm_Tuple(const Tuple* tuple) {
+    // Only an annotated type constrains the ops; an inferred one follows them.
+    if (has_inferred_type(tuple)) return new_world().tuple(rewrite(tuple->ops()));
+
+    auto type = rewrite(tuple->type());
+    auto ops  = rewrite(tuple->ops());
+    auto n    = ops.size();
+    if (Lit::isa(type->arity()) != n) return coerce(type, new_world().tuple(ops));
+    for (size_t i = 0; i != n; ++i)
+        ops[i] = coerce(new_world().component(type, Defs(ops).subspan(0, i), n, i), ops[i]);
+    return new_world().tuple(type, ops);
+}
+
+const Def* RWPhase::rewrite_stub(Def* old_mut, Def* new_mut) {
+    auto old_lam = old_mut->isa<Lam>();
+    auto new_lam = new_mut->isa<Lam>();
+    if (!old_lam || !new_lam || !old_lam->is_set()) return Rewriter::rewrite_stub(old_mut, new_mut);
+
+    map(old_mut, new_mut);
+    auto _  = enter(old_mut);
+    auto pi = new_lam->type();
+    // Creating the Var just to reduce a non-dependent codomain would mark it as used.
+    auto codom = pi->has_var() ? pi->reduce(new_lam->var()) : pi->codom();
+    new_lam->set(rewrite(old_lam->filter()), coerce(codom, rewrite(old_lam->body())));
+    return seal(old_mut, new_mut);
+}
+
+const Def* RWPhase::coerce(const Def* type, const Def* val) {
+    if (val->type() == type) return val;
+    auto todo = DefVec{val};
+    auto res  = reshape(todo, type);
+    while (!todo.empty() && new_world().inhabitant(todo.back()->type()))
+        todo.pop_back();
+    if (!todo.empty()) fe::throwf("cannot coerce `{}` to `{}`", val, type);
+    return res;
+}
+
+const Def* RWPhase::reshape(DefVec& todo, const Def* type) {
+    auto& w    = new_world();
+    auto front = todo.empty() ? nullptr : todo.back();
+    if (front) {
+        if (auto res = Check::coerce(type, front)) return todo.pop_back(), res;
+        if (auto res = eta_coerce(type, front)) return todo.pop_back(), res;
+    }
+
+    if (auto s = w.inhabitant(type)) return s;
+    if (front && w.inhabitant(front->type())) return todo.pop_back(), reshape(todo, type);
+
+    if (splittable(type)) {
+        auto n     = type->num_tprojs();
+        auto parts = DefVec();
+        for (size_t i = 0; i != n; ++i)
+            parts.emplace_back(reshape(todo, w.component(type, parts, n, i)));
+        return w.tuple(type, parts);
+    }
+
+    if (front && front->type()->num_tprojs() != 1) {
+        todo.pop_back();
+        auto pieces = front->tprojs();
+        todo.insert(todo.end(), pieces.rbegin(), pieces.rend());
+        return reshape(todo, type);
+    }
+
+    fe::throwf("cannot coerce to `{}`", type);
+}
+
+const Def* RWPhase::eta_coerce(const Def* type, const Def* val) {
+    auto dst = type->isa<Pi>();
+    auto src = val->type()->isa<Pi>();
+    if (!dst || !src) return nullptr;
+    auto& memo = etas_[type][val];
+    if (memo) return memo;
+
+    auto eta   = new_world().mut_lam(dst)->set(val->dbg_key());
+    memo       = eta; // before the recursion below may rehash etas_
+    auto arg   = coerce(src->dom(), eta->var());
+    auto codom = dst->reduce(eta->var());
+    log().d("coerce {}: {} → {}", val, src, dst);
+    return eta->set(false, coerce(codom, new_world().app(val, arg)));
 }
 
 /*
@@ -182,7 +339,7 @@ void PhaseMan::apply(Phase& phase) {
     auto& man = static_cast<PhaseMan&>(phase);
     Phases new_phases;
     for (auto& old_phase : man.phases())
-        new_phases.emplace_back(std::unique_ptr<Phase>(static_cast<Phase*>(old_phase->recreate().release())));
+        new_phases.emplace_back(old_phase->recreate());
     apply(man.fixed_point(), std::move(new_phases));
 }
 
@@ -191,37 +348,34 @@ void PhaseMan::start() {
     auto n         = phases().size();
     // A phase's run is a deterministic function of the World's content.
     // So a phase only needs to run (again) if the World (may have) changed since its last quiet run.
-    auto stale = absl::FixedArray<bool>(n, true);
-    auto ran   = absl::FixedArray<bool>(n, false);
+    auto all   = fe::Bitset(n, true);
+    auto stale = all;
+    auto ran   = fe::Bitset(n, false);
 
-    auto any_stale = [&stale]() { return std::ranges::any_of(stale, [](bool b) { return b; }); };
-
-    for (uint32_t iter = 0; any_stale(); ++iter) {
-        if (iter >= max_iters) error("phase `{}` did not reach a fixed point after {} iterations", name(), max_iters);
-        if (fixed_point()) VLOG("🔄 fixed-point iteration: {}", iter);
+    for (uint32_t iter = 0; stale.any(); ++iter) {
+        if (iter >= max_iters)
+            fe::throwf("phase `{}` did not reach a fixed point after {} iterations", name(), max_iters);
+        if (fixed_point()) log().v("🔄 fixed-point iteration {}", iter);
 
         bool todo = false;
         for (size_t i = 0; i != n; ++i) {
             auto& phase = phases()[i];
-            if (!stale[i]) {
-                VLOG("skipping `{}`: World unchanged since its last quiet run", phase->name());
+            if (!stale.test(i)) {
+                log().v("skip `{}`: World unchanged since its last quiet run", phase->name());
                 profile_count("phases.skipped");
                 continue;
             }
 
-            if (ran[i]) { // re-runs need a fresh instance
-                auto new_phase = std::unique_ptr<Phase>(static_cast<Phase*>(phase->recreate().release()));
-                swap(new_phase, phase);
-            }
+            if (ran.test(i)) phase = phase->recreate(); // re-runs need a fresh instance
 
             phase->run();
-            ran[i]   = true;
-            stale[i] = false;
+            ran.set(i);
+            stale.clear(i);
 
             if (phase->todo()) {
                 todo = true;
                 // The World changed: everyone - including this phase itself - gets another look.
-                std::ranges::fill(stale, true);
+                stale = all;
             }
         }
 

@@ -3,6 +3,8 @@
 
 #include "mim/ast/ast.h"
 
+#include "family.h"
+
 using namespace std::literals;
 
 namespace mim::ast {
@@ -17,63 +19,254 @@ public:
     AST& ast() const { return ast_; }
     World& world() { return ast().world(); }
     Driver& driver() { return world().driver(); }
+    fe::Error& error() { return driver().error(); }
 
-    /// @p name is the full syntactic name of *this* registration (`%plugin.tag` or `%plugin.tag.sub`).
-    /// We must take it from the declaration rather than from Def::sym, since hash-consing can make several
-    /// annexes share a single Def (e.g. `let %foo.bar = 23; let %foo.baz = 23;`).
+    /// @p name is *this* registration's own (unqualified) Dbg::sym; AnnexInfo::qualified turns it into the
+    /// full `plugin.tag[.sub]` name. We must take it from the declaration rather than from Def::sym, since
+    /// hash-consing can make several annexes share a single Def (e.g. `mod foo anx let bar = 23; anx let baz = 23;
+    /// end`).
     void attach(AnnexInfo* annex, sub_t sub, Sym name, const Def* def) {
-        if (annex) world().annexes().attach(annex->plugin_id(), annex->id.tag, sub, name, def);
+        if (annex)
+            world().annexes().attach(annex->plugin_id(), annex->id.tag, sub, annex->qualified(driver(), name), def);
     }
 
-    absl::node_hash_map<Sigma*, fe::SymMap<size_t>, GIDHash<const Def*>> sigma2sym2idx;
+    void attach_alias(AnnexInfo* annex, sub_t sub, Sym name) {
+        world().annexes().attach_alias(annex->plugin_id(), annex->id.tag, sub, annex->qualified(driver(), name));
+    }
+
+    /// @name Names
+    /// Field and constructor names live on the Def, so same-shaped types share one table.
+    ///@{
+    void add_names(const Def* def, const fe::SymMap<size_t>& sym2idx) {
+        auto& names = def2sym2idx_[def];
+        for (auto [sym, i] : sym2idx)
+            if (auto [j, ins] = names.emplace(sym, i); !ins && j->second != i) j->second = Ambiguous;
+    }
+
+    /// Copies the names of @p nom's declaration onto the corresponding parts of @p nom - an instance of it.
+    void adopt_names(const Nom* nom) {
+        auto decl = nom_decl(nom).decl;
+        if (decl == nom || !adopted_.emplace(nom).second) return;
+        auto visited = DefSet();
+        adopt_names(decl->op(), nom->op(), visited);
+    }
+
+    /// A declared @p variant prints under its name; an anonymous one spells out its cases, named as source does.
+    /// Streams lazily so that it still renders under the PlainNames guard Error::msg formats within.
+    auto variant_str(const Def* variant) {
+        auto names = std::vector<std::string>();
+        for (auto i : std::views::iota(size_t(0), variant->num_ops())) {
+            auto syms = ctor_syms(variant, i);
+            names.emplace_back(syms.empty() ? std::format("_{}", i) : syms.front());
+        }
+        return fe::StreamFn{[variant, names = std::move(names)](std::ostream& os) -> std::ostream& {
+            if (auto sym = variant->sym(); sym && sym != '_') return std::print(os, "{}", variant), os;
+            if (names.empty()) return os << "(|)";
+            os << '(';
+            for (auto sep = ""; auto i : std::views::iota(size_t(0), names.size())) {
+                std::print(os, "{}| {}", sep, names[i]);
+                if (auto op = variant->op(i); op != variant->world().sigma()) std::print(os, ": {}", op);
+                sep = " ";
+            }
+            return os << ')';
+        }};
+    }
+
+    std::optional<size_t> find_name(const Def* def, Dbg dbg) {
+        if (auto i = def2sym2idx_.find(def); i != def2sym2idx_.end()) {
+            if (auto j = i->second.find(dbg.sym()); j != i->second.end()) {
+                if (j->second == Ambiguous) {
+                    if (def->isa<Variant>())
+                        error()
+                            .e(dbg.loc(), "constructor `{}` is ambiguous in variant `{}`", dbg, variant_str(def))
+                            .n("variants of the same shape name it at different positions")
+                            .n("select the case by index instead, as in `T#0`")
+                            .bail();
+                    error()
+                        .e(dbg.loc(), "field `{}` is ambiguous in `{}`", dbg, def)
+                        .n("sigmas of the same shape name it at different positions")
+                        .n("select the field by index instead, as in `t#0_2`")
+                        .bail();
+                }
+                return j->second;
+            }
+        }
+
+        return {};
+    }
+
+    void add_ctors(const Def* variant, const VariantExpr* expr) {
+        auto sym2idx = fe::SymMap<size_t>();
+        for (size_t i = 0, n = expr->num_ctors(); i != n; ++i) {
+            auto dbg = expr->ctor(i)->dbg();
+            if (!sym2idx.emplace(dbg.sym(), i).second) error().e(dbg.loc(), "constructor `{}` declared twice", dbg);
+        }
+        add_names(variant, sym2idx);
+    }
+
+    size_t ctor(const Def* variant, Dbg dbg) {
+        if (auto i = find_name(variant, dbg)) return *i;
+        error().e(dbg.loc(), "variant `{}` has no constructor `{}`", variant_str(variant), dbg).bail();
+    }
+
+    /// Every name case @p i goes by, sorted for a deterministic diagnostic; its index if it has none.
+    std::string ctor_names(const Def* variant, size_t i) {
+        auto names = ctor_syms(variant, i);
+        if (names.empty()) return std::format("`{}`", i);
+        for (auto& name : names)
+            name = std::format("`{}`", name);
+        return std::format("{}", fe::Join(names, " / "));
+    }
+    ///@}
+
+    /// @name Nominal scope
+    /// Only the `mod` declaring a private `nom` - or one nested in it - may access its representation.
+    ///@{
+    void push_mod(const ModDecl* mod) { mods_.emplace_back(mod); }
+    void pop_mod() { mods_.pop_back(); }
+    fe::Vector<const ModDecl*> reset_mods() { return std::exchange(mods_, {}); }
+    void restore_mods(fe::Vector<const ModDecl*> mods) { mods_ = std::move(mods); }
+
+    struct NomInfo {
+        const Nom* decl;
+        const ModDecl* owner;
+    };
+
+    void add_nom(const Nom* nom, const NomDecl* decl) {
+        key2nom_[nom->key()] = {nom, decl->rep_vis() == Vis::Priv ? mods_.back() : nullptr};
+    }
+
+    /// The declared `nom` that @p nom instantiates and, if its representation is private, the `mod` owning it.
+    NomInfo nom_decl(const Nom* nom) const {
+        auto i = key2nom_.find(nom->key());
+        return i != key2nom_.end() ? i->second : NomInfo{nom, nullptr};
+    }
+
+    bool within(const ModDecl* mod) const { return std::ranges::find(mods_, mod) != mods_.end(); }
+    ///@}
 
 private:
+    static constexpr size_t Ambiguous = size_t(-1);
+
+    /// Walks @p decl and @p inst in lockstep; a `Sigma` may have normalized to an `Arr` in @p inst.
+    void adopt_names(const Def* decl, const Def* inst, DefSet& visited) {
+        if (decl == inst || decl->isa<Nom>() || inst->isa<Nom>() || !visited.emplace(decl).second) return;
+        if (auto i = def2sym2idx_.find(decl); i != def2sym2idx_.end()) {
+            auto sym2idx = i->second; // add_names may rehash def2sym2idx_
+            add_names(inst, sym2idx);
+        }
+        if (decl->node() == inst->node() && decl->num_ops() == inst->num_ops()) {
+            for (size_t k = 0, n = decl->num_ops(); k != n; ++k)
+                adopt_names(decl->op(k), inst->op(k), visited);
+        } else if (auto sigma = decl->isa<Sigma>()) {
+            if (auto n = sigma->num_ops(); Lit::isa(inst->arity()) == n)
+                for (size_t k = 0; k != n; ++k)
+                    adopt_names(sigma->op(k), inst->proj(n, k), visited);
+        }
+    }
+
+    std::vector<std::string> ctor_syms(const Def* variant, size_t i) {
+        auto names = std::vector<std::string>();
+        if (auto j = def2sym2idx_.find(variant); j != def2sym2idx_.end())
+            for (const auto& [sym, k] : j->second)
+                if (k == i) names.emplace_back(sym.str());
+        std::ranges::sort(names);
+        return names;
+    }
+
     AST& ast_;
+    DefMap<fe::SymMap<size_t>> def2sym2idx_;
+    fe::Vector<const ModDecl*> mods_;
+    ankerl::unordered_dense::map<flags_t, NomInfo> key2nom_;
+    DefSet adopted_;
 };
 
 /*
- * Module
+ * File
  */
 
-void Module::emit(AST& ast) const {
+void File::emit(AST& ast) const {
     auto emitter = Emitter(ast);
     emit(emitter);
 }
 
-void Module::emit(Emitter& e) const {
+void File::emit(Emitter& e) const {
+    if (emitted_) return;
+    emitted_ = true;
+
+    // An imported file is emitted from within its importer's mods, but it is not nested in them.
+    auto mods = e.reset_mods();
+    e.push_mod(this);
     auto _ = e.world().push(loc());
-    for (const auto& import : implicit_imports())
+    for (auto import : implicit_imports())
         import->emit(e);
-    for (const auto& import : imports())
-        import->emit(e);
-    for (const auto& decl : decls())
-        decl->emit(e);
+    emit_decls(e);
+    e.restore_mods(std::move(mods));
 }
 
-void Import::emit(Emitter& e) const { module()->emit(e); }
+void UseDecl::emit(Emitter& e) const {
+    if (file()) file()->emit(e);
+}
 
 /*
  * Ptrn::emit_value
  */
 
-const Def* ErrorPtrn::emit_value(Emitter&, const Def* def) const { return def; }
-
-const Def* IdPtrn::emit_value(Emitter& e, const Def* def) const {
-    emit_type(e);
-    return def_ = def->set(dbg());
+/// A wildcard binds nothing, so the Def it would name need not exist - and a dump would then have to name it.
+static bool is_wildcard(const Ptrn* ptrn) {
+    if (auto id = ptrn->isa<IdPtrn>()) return id->dbg().is_anon();
+    if (auto tuple = ptrn->isa<TuplePtrn>())
+        return std::ranges::all_of(tuple->ptrns(), [](auto p) { return is_wildcard(p.get()); });
+    return false;
 }
 
-const Def* GrpPtrn::emit_value(Emitter&, const Def* def) const { return def_ = def->set(dbg()); }
+const Def* ErrorPtrn::emit_value(Emitter&, const Def* def) const { return def; }
+
+static const Def* assign(Emitter& e, const Ptrn* ptrn, const Def* type, const Def* def) {
+    if (auto res = Check::coerce(type, def)) return res->set(ptrn->dbg());
+
+    e.error()
+        .e(ptrn->loc(), "value bound to `{}` is not assignable to its annotated type", ptrn->dbg().sym())
+        .n("expected `{}`, got `{}`", type, type_of(def))
+        .bail();
+}
+
+const Def* IdPtrn::emit_value(Emitter& e, const Def* def) const {
+    return def_ = type() ? assign(e, this, emit_type(e), def) : def->set(dbg());
+}
+
+const Def* IdDecl::emit(const Def* def) const { return def_ = def->set(dbg()); }
+
+const Def* GrpPtrn::emit_value(Emitter& e, const Def* def) const { return def_ = assign(e, this, emit_type(e), def); }
 
 const Def* AliasPtrn::emit_value(Emitter& e, const Def* def) const {
     return def_ = ptrn()->emit_value(e, def)->set(dbg());
 }
 
+const Def* Ptrn::emit_proj(Emitter& e, const Def* def, size_t n, size_t i) const {
+    auto _ = e.world().push(loc());
+    if (is_wildcard(this)) return emit_type(e), nullptr;
+    return emit_value(e, def->proj(n, i));
+}
+
+/// Binds @p ptrn to the Var of @p mut - which a wildcard does not create.
+static void emit_var(Emitter& e, const Ptrn* ptrn, Def* mut) {
+    if (is_wildcard(ptrn))
+        ptrn->emit_type(e);
+    else
+        ptrn->emit_value(e, mut->var());
+}
+
 const Def* TuplePtrn::emit_value(Emitter& e, const Def* def) const {
     auto _ = e.world().push(loc());
     emit_type(e);
-    for (size_t i = 0, n = num_ptrns(); i != n; ++i)
-        ptrn(i)->emit_value(e, def->proj(n, i));
+    auto n = num_ptrns();
+    // An unset Hole type has arity 1 until inference resolves it, so only a known arity may be rejected.
+    if (auto t = def->type()->zonk(); n != 1 && !Hole::isa_unset(t))
+        if (auto a = Lit::isa(t->arity()); a && *a != n)
+            e.error().e(loc(), "pattern has {} components, but a value of type `{}` has {}", n, t, *a).bail();
+    for (size_t i = 0; i != n; ++i)
+        ptrn(i)->emit_proj(e, def, n, i);
     return def_ = def;
 }
 
@@ -81,16 +274,17 @@ const Def* TuplePtrn::emit_value(Emitter& e, const Def* def) const {
  * Ptrn::emit_Type
  */
 
-const Def* ErrorPtrn::emit_type(Emitter&) const { fe::unreachable(); }
+const Def* ErrorPtrn::emit_type(Emitter&) const { std::unreachable(); }
 
 const Def* IdPtrn::emit_type(Emitter& e) const {
-    auto _ = e.world().push(loc());
-    return type() ? type()->emit(e) : e.world().mut_hole_type();
+    auto _               = e.world().push(loc());
+    return emitted_type_ = type() ? type()->emit(e) : e.world().mut_hole_type();
 }
 
 const Def* AliasPtrn::emit_type(Emitter& e) const { return ptrn()->emit_type(e); }
 
-const Def* GrpPtrn::emit_type(Emitter& e) const { return id()->emit_type(e); }
+// The leading IdPtrn has just emitted the group's type.
+const Def* GrpPtrn::emit_type(Emitter&) const { return id()->emitted_type_; }
 
 const Def* TuplePtrn::emit_type(Emitter& e) const { return emit_body(e, {}); }
 
@@ -98,28 +292,29 @@ const Def* TuplePtrn::emit_body(Emitter& e, const Def* decl) const {
     auto _ = e.world().push(loc());
     auto n = num_ptrns();
     Sigma* sigma;
-    if (decl) {
+    if (decl)
         sigma = decl->as_mut<Sigma>();
-    } else {
-        auto type = e.world().type_infer_univ();
-        sigma     = e.world().mut_sigma(type, n);
-    }
-    auto var      = sigma->var();
-    auto& sym2idx = e.sigma2sym2idx[sigma];
+    else
+        sigma = e.world().mut_sigma(e.world().type_pending(), n);
+    auto var     = sigma->var();
+    auto sym2idx = fe::SymMap<size_t>();
 
     for (size_t i = 0; i != n; ++i) {
         sigma->set(i, ptrn(i)->emit_type(e));
-        ptrn(i)->emit_value(e, var->proj(n, i));
-        if (auto id = ptrn(i)->isa<IdPtrn>()) sym2idx[id->dbg().sym()] = i;
+        ptrn(i)->emit_proj(e, var, n, i);
+        if (auto sym = field(i)) sym2idx[sym] = i;
     }
 
-    if (auto imm = sigma->immutabilize()) return imm;
-    return sigma;
+    e.add_names(sigma, sym2idx);
+    auto imm = sigma->immutabilize();
+    // A 1-Sigma collapses to its field's type, which must not inherit the name.
+    if (imm && n > 1) e.add_names(imm, sym2idx);
+    return imm ? imm : sigma;
 }
 
 const Def* TuplePtrn::emit_decl(Emitter& e, const Def* type) const {
     auto _ = e.world().push(loc());
-    type   = type ? type : e.world().type_infer_univ();
+    type   = type ? type : e.world().type_infer_level();
     return e.world().mut_sigma(type, num_ptrns());
 }
 
@@ -132,12 +327,30 @@ const Def* Expr::emit(Emitter& e) const {
     return emit_(e);
 }
 
-const Def* ErrorExpr::emit_(Emitter&) const { fe::unreachable(); }
+const Def* Expr::emit_decl(Emitter& e, const Def* type) const {
+    auto _ = e.world().push(loc());
+    return emit_decl_(e, type);
+}
+
+void Expr::emit_body(Emitter& e, const Def* decl) const {
+    auto _ = e.world().push(loc());
+    emit_body_(e, decl);
+}
+
+const Def* ErrorExpr::emit_(Emitter&) const { std::unreachable(); }
 const Def* HoleExpr::emit_(Emitter& e) const { return e.world().mut_hole_type(); }
 
-const Def* IdExpr::emit_(Emitter&) const {
+const Def* PathExpr::emit_(Emitter& e) const {
     assert(decl());
-    return decl()->def();
+    if (auto def = decl()->def()) return def;
+    if (auto nom = decl()->isa<NomDecl>()) {
+        if (auto def = nom->emit_ahead(e)) return def;
+        e.error()
+            .e(loc(), "nominal type `{}` refers to itself", dbg().sym())
+            .n("a `nom` can only refer to itself through a sigma, a variant, or a function type")
+            .bail();
+    }
+    e.error().e(loc(), "`{}` is a module and not a value", dbg().sym()).bail();
 }
 
 const Def* TypeExpr::emit_(Emitter& e) const {
@@ -150,10 +363,10 @@ const Def* RuleExpr::emit_(Emitter& e) const {
     return e.world().reform(m);
 }
 
-const Def* PrimaryExpr ::emit_(Emitter& e) const {
+const Def* PrimaryExpr::emit_(Emitter& e) const {
     // clang-format off
     switch (tag()) {
-        case Tag::K_Univ: return e.world().univ();
+        case Tag::K_Level: return e.world().type_level();
         case Tag::K_Nat:  return e.world().type_nat();
         case Tag::K_Idx:  return e.world().type_idx();
         case Tag::K_Bool: return e.world().type_bool();
@@ -171,15 +384,15 @@ const Def* PrimaryExpr ::emit_(Emitter& e) const {
         case Tag::K_I64:  return e.world().type_i64();
         case Tag::T_star: return e.world().type<0>();
         case Tag::T_box:  return e.world().type<1>();
-        default: fe::unreachable();
+        default: std::unreachable();
     }
     // clang-format on
 }
 
-/// If @p type is a `%math.F` type of known precision/exponent, yields its bit width.
+/// If @p type is a `math.F` type of known precision/exponent, yields its bit width.
 /// Note that libmim must not depend on the generated math plugin header, so lookup the Axm at runtime instead.
 static std::optional<nat_t> isa_math_f(Emitter& e, const Def* type) {
-    auto math_f = e.world().annex(e.world().sym("%math.F"));
+    auto math_f = e.world().annex(e.world().sym("math.F"));
     if (auto app = type->zonk()->isa<App>(); math_f && app && app->callee() == math_f) {
         if (auto [p, ex] = app->arg()->projs<2>([](auto op) { return Lit::isa(op); }); p && ex) {
             if (*p == 10 && *ex == 5) return 16;
@@ -198,7 +411,7 @@ static u64 encode_f(Emitter& e, [[maybe_unused]] Loc loc, const Def* t, u64 bits
 #if defined(__STDCPP_FLOAT16_T__)
             case 16: return std::bit_cast<u16>(f16(val));
 #else
-            case 16: error(loc, "16-bit floating-point literals are not supported on this platform");
+            case 16: e.error().e(loc, "16-bit floating-point literals are not supported on this platform").bail();
 #endif
             case 32: return std::bit_cast<u32>(f32(val));
             default: break;
@@ -213,109 +426,344 @@ const Def* LitExpr::emit_(Emitter& e) const {
     switch (tag()) {
         case Tag::L_f:   return t ? e.world().lit(t, encode_f(e, loc(), t, tok().lit_u())) : e.world().lit_nat(tok().lit_u());
         case Tag::L_s:
+            if (auto size = t ? Idx::isa_lit(t) : std::nullopt; size && *size != 0) {
+                auto mag = -tok().lit_u();
+                return e.world().lit(t, (*size - mag % *size) % *size);
+            }
+            [[fallthrough]];
         case Tag::L_u:   return t ? e.world().lit(t, tok().lit_u()) : e.world().lit_nat(tok().lit_u());
-        case Tag::L_i:   return tok().lit_i();
+        case Tag::L_i:   { auto [size, val] = tok().lit_i(); return e.world().lit_idx(size, val); }
         case Tag::L_c:   return e.world().lit_i8(tok().lit_c());
         case Tag::L_str: return e.world().tuple(tok().sym());
         case Tag::T_bot: return t ? e.world().bot(t) : e.world().type_bot();
         case Tag::T_top: return t ? e.world().top(t) : e.world().type_top();
-        default: fe::unreachable();
+        default: std::unreachable();
     }
     // clang-format on
 }
 
 const Def* DeclExpr::emit_(Emitter& e) const {
     if (is_where())
-        for (const auto& decl : decls() | std::views::reverse)
+        for (auto decl : decls() | std::views::reverse)
             decl->emit(e);
     else
-        for (const auto& decl : decls())
+        for (auto decl : decls())
             decl->emit(e);
     return expr()->emit(e);
 }
 
-const Def* ArrowExpr::emit_decl(Emitter& e, const Def* type) const {
-    return decl_ = e.world().mut_pi(type, false)->set(loc());
+const Def* InfixExpr::emit_decl_(Emitter& e, const Def* type) const {
+    assert(op().isa(Tag::T_arrow_r));
+    return pi_ = e.world().mut_pi(type, false);
 }
 
-void ArrowExpr::emit_body(Emitter& e, const Def*) const {
-    decl_->set_dom(dom()->emit(e));
-    decl_->set_codom(codom()->emit(e)); // TODO try to immutabilize
+void InfixExpr::emit_body_(Emitter& e, const Def*) const {
+    pi_->set_dom(lhs()->emit(e));
+    pi_->set_codom(rhs()->emit(e)); // TODO try to immutabilize
 }
 
-const Def* ArrowExpr::emit_(Emitter& e) const {
-    auto d = dom()->emit(e);
-    auto c = codom()->emit(e);
-    return e.world().pi(d, c);
-}
-
-const Def* UnionExpr::emit_(Emitter& e) const {
-    DefVec etypes;
-    for (auto& t : types())
-        etypes.emplace_back(t->emit(e));
-    return e.world().join(etypes);
-}
-
-const Def* InjExpr::emit_(Emitter& e) const {
-    auto v = value()->emit(e);
-    auto t = type()->emit(e);
-    return e.world().inj(t, v);
-}
-
-Lam* MatchExpr::Arm::emit(Emitter& e) const {
-    auto _     = e.world().push(loc());
-    auto dom_t = ptrn()->emit_type(e);
-    auto pi    = e.world().pi(dom_t, e.world().mut_hole_type());
-    auto lam   = e.world().mut_lam(pi);
-    ptrn()->emit_value(e, lam->var());
-    return lam->set(true, body()->emit(e));
-}
-
-const Def* MatchExpr::emit_(Emitter& e) const {
-    DefVec res;
-    res.emplace_back(scrutinee()->emit(e));
-    for (const auto& arm : arms())
-        res.emplace_back(arm->emit(e));
-    return e.world().match(res);
-}
-
-void PiExpr::Dom::emit_type(Emitter& e) const {
-    pi_        = decl_ ? decl_ : e.world().mut_pi(e.world().type_infer_univ(), is_implicit());
-    auto dom_t = ptrn()->emit_type(e);
-
-    if (ret()) {
-        auto sigma = e.world().mut_sigma(2)->set(loc());
-        auto var   = sigma->var()->set(ret()->loc().anew_begin());
-        sigma->set(0, dom_t);
-        ptrn()->emit_value(e, var->proj(2, 0));
-        auto ret_t = e.world().cn(ret()->emit_type(e));
-        sigma->set(1, ret_t);
-
-        if (auto imm = sigma->immutabilize())
-            dom_t = imm;
-        else
-            dom_t = sigma;
-        pi_->set_dom(dom_t);
+/// `a ∪ b ∪ c` is one n-ary Join, so flatten the left spine the left-associative parse built.
+static void emit_union(Emitter& e, const Expr* expr, DefVec& types) {
+    if (auto infix = InfixExpr::isa_op(Tag::T_union, expr)) {
+        emit_union(e, infix->lhs(), types);
+        types.emplace_back(infix->rhs()->emit(e));
     } else {
-        pi_->set_dom(dom_t);
-        ptrn()->emit_value(e, pi_->var());
+        types.emplace_back(expr->emit(e));
     }
 }
 
-const Def* PiExpr::emit_decl(Emitter& e, const Def* type) const {
-    return dom()->decl_ = e.world().mut_pi(type, dom()->is_implicit())->set(loc());
+const Def* InfixExpr::emit_index(Emitter& e, const Def* tup) const {
+    auto& w = e.world();
+    // A simple path names a field of tup's Sigma before anything the binder resolved it to.
+    if (auto path = rhs()->isa<PathExpr>(); path && path->path()->dbgs().size() == 1) {
+        auto dbg = path->dbg();
+        if (auto i = e.find_name(tup->type(), dbg)) {
+            if (auto decl = path->decl())
+                e.error()
+                    .w(dbg.loc(), "`{}` names both field {} of `{}` and a declaration in scope; using the field", dbg,
+                       *i, tup->type())
+                    .n(decl->loc(), "declaration here")
+                    .n("parenthesize it, as in `#({})`, to extract by the declaration instead", dbg);
+            return w.lit(w.type_idx(tup->type()->arity()), *i);
+        }
+        if (!path->decl()) e.error().e(dbg.loc(), "cannot resolve field `{}` for extraction", dbg).bail();
+    }
+    return rhs()->emit(e);
 }
 
-void PiExpr::emit_body(Emitter& e, const Def*) const { emit(e); }
+/// A private `nom`'s representation is confined to the `mod` that declared it; the type itself is not.
+static void check_nom_scope(Emitter& e, Loc loc, const Nom* nom) {
+    auto [decl, owner] = e.nom_decl(nom);
+    if (!owner || e.within(owner)) return;
+    auto where = owner->isa<File>() ? fe::format_cite("file `{}`", owner->loc().src->path().filename().string())
+                                    : fe::format_cite("module `{}`", owner->dbg());
+    e.error()
+        .e(loc, "the representation of private nominal type `{}` is only accessible within {}", nom, where)
+        .n(decl->loc(), "declared here")
+        .bail();
+}
+
+/// Checks and prepares access to @p nom's representation.
+static void open_nom(Emitter& e, Loc loc, const Nom* nom) {
+    check_nom_scope(e, loc, nom);
+    e.adopt_names(nom);
+}
+
+/// Unwraps @p tup if it is a value of a `nom` and @p ex names one of its fields; `nullptr` otherwise.
+static const Def* unwrap_field(Emitter& e, const InfixExpr* ex, const Def* tup) {
+    auto nom  = tup->isa_type<Nom>();
+    auto path = ex->rhs()->isa<PathExpr>();
+    if (!nom || !path || path->path()->dbgs().size() != 1) return nullptr;
+    e.adopt_names(nom);
+    if (!e.find_name(nom->op(), path->dbg())) return nullptr;
+    open_nom(e, ex->loc(), nom);
+    return e.world().struc(tup);
+}
+
+const Def* PrefixExpr::emit_(Emitter& e) const {
+    auto def = rhs()->emit(e);
+    switch (op().tag()) {
+        case Tag::T_extract:
+            if (auto nom = def->isa_type<Nom>()) {
+                open_nom(e, loc(), nom);
+                return e.world().struc(def);
+            }
+            if (!def->zonk()->isa_type<Single>()) {
+                auto& err = e.error().e(
+                    loc(), "operand of prefix `#` is of type `{}` but must be of nominal or singleton type",
+                    type_of(def));
+                if (def->zonk()->isa<Nom>()) err.n("`{}` is a nominal type itself; `#` unwraps a value of it", def);
+                err.bail();
+            }
+            return e.world().unwrap(def);
+        default: std::unreachable();
+    }
+}
+
+/// `T#C` or `T#i` selects case `C` or `i` of the Variant `T`: a constructor function - or its value for a `[]` payload.
+/// If @p nom is given, `T` is its body and the constructor yields @p nom.
+static const Def* emit_ctor(Emitter& e, const Variant* variant, const Expr* index, const Nom* nom = nullptr) {
+    auto& w = e.world();
+    auto i  = std::optional<nat_t>();
+
+    if (auto path = index->isa<PathExpr>(); path && path->path()->dbgs().size() == 1) {
+        i = e.find_name(variant, path->dbg());
+        if (!i && !path->decl())
+            e.error()
+                .e(path->dbg().loc(), "variant `{}` has no constructor `{}`", e.variant_str(variant), path->dbg())
+                .bail();
+    }
+    if (!i) i = Lit::isa(index->emit(e));
+    if (!i) e.error().e(index->loc(), "a case of a variant must be selected by name or by literal index").bail();
+    if (*i >= variant->num_ops())
+        e.error()
+            .e(index->loc(), "variant `{}` has {} cases but case {} was requested", e.variant_str(variant),
+               variant->num_ops(), *i)
+            .bail();
+
+    auto type    = nom ? static_cast<const Def*>(nom) : variant;
+    auto payload = variant->op(*i);
+    if (payload == w.sigma()) return w.inj(type, *i, w.tuple());
+    auto ctor = w.mut_lam(w.pi(payload, type));
+    return ctor->set(true, w.inj(type, *i, ctor->var()));
+}
+
+const Def* InfixExpr::emit_(Emitter& e) const {
+    auto& w = e.world();
+
+    switch (op().tag()) {
+        case Tag::T_union: {
+            DefVec types;
+            emit_union(e, this, types);
+            return w.join(types);
+        }
+        case Tag::T_extract: {
+            auto tup = w.implicit_holes(lhs()->emit(e));
+            if (auto variant = tup->isa<Variant>()) return emit_ctor(e, variant, rhs());
+            if (auto nom = tup->isa<Nom>()) {
+                if (auto variant = nom->op()->isa<Variant>()) {
+                    open_nom(e, loc(), nom);
+                    return emit_ctor(e, variant, rhs(), nom);
+                }
+            }
+            if (auto value = unwrap_field(e, this, tup)) tup = value;
+            return w.extract(tup, emit_index(e, tup));
+        }
+        case Tag::T_arrow_l: {
+            fe::Vector<const InfixExpr*> exs;
+            auto base = lhs();
+            while (auto ex = InfixExpr::isa_op(Tag::T_extract, base)) {
+                exs.emplace_back(ex);
+                base = ex->lhs();
+            }
+
+            if (exs.empty())
+                e.error()
+                    .e(lhs()->loc(), "expected `#` on the left-hand side of `{}`", Tok::tag2str(op().tag()))
+                    .n("an update needs a component, as in `tuple#index {} value`", Tok::tag2str(op().tag()))
+                    .bail();
+
+            auto tup = base->emit(e);
+            DefVec tups, idxs;
+            fe::Vector<const Nom*> noms;
+            for (auto ex : exs | std::views::reverse) {
+                auto value = unwrap_field(e, ex, tup);
+                noms.emplace_back(value ? tup->isa_type<Nom>() : nullptr);
+                if (value) tup = value;
+                auto idx = ex->emit_index(e, tup);
+                tups.emplace_back(tup);
+                idxs.emplace_back(idx);
+                tup = w.extract(tup, idx);
+            }
+
+            auto val = rhs()->emit(e);
+            for (size_t i = tups.size(); i-- != 0;) {
+                val = w.insert(tups[i], idxs[i], val);
+                if (noms[i]) val = w.name(noms[i], val);
+            }
+            return val;
+        }
+        default: break;
+    }
+
+    auto c = callee() ? callee()->emit(e) : nullptr;
+    auto l = lhs()->emit(e);
+    auto r = rhs()->emit(e);
+
+    switch (op().tag()) {
+        case Tag::T_arrow_r: return w.pi(l, r);
+        case Tag::T_at: return w.app(l, r);
+        case Tag::K_inj:
+            r = w.implicit_holes(r);
+            if (auto nom = r->isa<Nom>()) check_nom_scope(e, loc(), nom);
+            return w.inj(r, l);
+        default: return w.implicit_app(c, w.tuple({l, r})); // MIM_INFIX_SUGAR
+    }
+}
+
+Lam* MatchExpr::Arm::emit(Emitter& e, const Def* dom) const {
+    auto _ = e.world().push(loc());
+    if (ptrn()) {
+        auto dom_t = ptrn()->emit_type(e);
+        if (dom && !Check::alpha(dom_t, dom))
+            e.error()
+                .e(ptrn()->loc(), "pattern of type `{}` does not match the constructor's payload `{}`", dom_t, dom)
+                .bail();
+        if (!dom) dom = dom_t;
+    }
+    auto lam = e.world().mut_lam(e.world().pi(dom, e.world().mut_hole_type()));
+    if (ptrn()) ptrn()->emit_value(e, lam->var());
+    return lam->set(true, body()->emit(e));
+}
+
+const Def* MatchExpr::emit_variant(Emitter& e, const Def* scrutinee, const Variant* variant) const {
+    auto sel = DefVec(variant->num_ops());
+    for (auto arm : arms()) {
+        auto i = size_t();
+        if (auto index = arm->index()) {
+            if (*index >= variant->num_ops())
+                e.error()
+                    .e(arm->loc(), "variant `{}` has {} cases but case {} was requested", e.variant_str(variant),
+                       variant->num_ops(), *index)
+                    .bail();
+            i = *index;
+        } else if (auto ctor = arm->ctor()) {
+            i = e.ctor(variant, ctor);
+        } else if (auto id = arm->ptrn()->isa<IdPtrn>(); id && !id->type()) {
+            i = e.ctor(variant, id->dbg());
+        } else {
+            e.error()
+                .e(arm->ptrn()->loc(), "an arm of a match on variant `{}` must name a constructor",
+                   e.variant_str(variant))
+                .bail();
+        }
+        if (sel[i]) {
+            e.error().w(arm->loc(), "this arm is unreachable: constructor {} is already handled",
+                        e.ctor_names(variant, i));
+            continue;
+        }
+        sel[i] = arm->emit(e, variant->op(i));
+    }
+
+    auto missing = std::vector<std::string>();
+    for (size_t i = 0, n = sel.size(); i != n; ++i)
+        if (!sel[i]) missing.emplace_back(e.ctor_names(variant, i));
+    if (!missing.empty()) e.error().e(loc(), "match expression has no arm for {}", fe::Join(missing, ", ")).bail();
+
+    auto ops = DefVec{scrutinee};
+    ops.append_range(sel);
+    return e.world().match(ops);
+}
+
+const Def* MatchExpr::emit_(Emitter& e) const {
+    DefVec ops;
+    ops.emplace_back(scrutinee()->emit(e));
+    if (auto variant = ops.front()->isa_type<Variant>()) return emit_variant(e, ops.front(), variant);
+    if (auto nom = ops.front()->isa_type<Nom>())
+        if (auto variant = nom->op()->isa<Variant>();
+            variant && std::ranges::any_of(arms(), [](const auto& arm) { return arm->index() || arm->ctor(); })) {
+            open_nom(e, loc(), nom);
+            return emit_variant(e, e.world().struc(ops.front()), variant);
+        }
+
+    for (auto arm : arms()) {
+        if (arm->index() || arm->ctor())
+            e.error()
+                .e(arm->loc(), "a constructor pattern needs a variant scrutinee")
+                .n("but the scrutinee has type `{}`", type_of(ops.front()))
+                .bail();
+        ops.emplace_back(arm->emit(e));
+    }
+    auto res = e.world().match(ops);
+
+    // Only a *source* arm is unreachable by mistake; substitution legitimately kills arms of a polymorphic match.
+    auto cases = Match::cases(ops.front());
+    for (size_t i = 0, n = num_arms(); i != n; ++i)
+        if (std::ranges::none_of(cases, [&](const Def* c) { return Match::accepts(ops[i + 1], c); }))
+            e.error().w(arm(i)->loc(), "this arm is unreachable: no case of `{}` matches `{}`", type_of(ops.front()),
+                        ops[i + 1]->isa_type<Pi>()->dom());
+
+    return res;
+}
+
+void PiExpr::Dom::emit_type(Emitter& e) const {
+    // Created before the push: the Pi belongs to the whole function type, not just to this Dom.
+    pi_        = decl_ ? decl_ : e.world().mut_pi(e.world().type_pending(), is_implicit());
+    auto _     = e.world().push(loc());
+    auto dom_t = ptrn()->emit_type(e);
+
+    if (ret_type()) {
+        auto sigma = e.world().mut_sigma(2);
+        auto var   = sigma->var();
+        sigma->set(0, dom_t);
+        ptrn()->emit_proj(e, var, 2, 0);
+        auto ret_t = e.world().cn(ret_type()->emit(e));
+        sigma->set(1, ret_t);
+
+        auto imm = sigma->immutabilize();
+        pi_->set_dom(imm ? imm : sigma);
+    } else {
+        pi_->set_dom(dom_t);
+        emit_var(e, ptrn(), pi_);
+    }
+}
+
+const Def* PiExpr::emit_decl_(Emitter& e, const Def* type) const {
+    return dom()->decl_ = e.world().mut_pi(type, dom()->is_implicit());
+}
+
+void PiExpr::emit_body_(Emitter& e, const Def*) const { emit(e); }
 
 const Def* PiExpr::emit_(Emitter& e) const {
     dom()->emit_type(e);
     auto cod = codom() ? codom()->emit(e) : e.world().type_bot();
-    return dom()->pi_->set_codom(cod);
+    auto pi  = dom()->pi_->set_codom(cod);
+    if (auto imm = pi->immutabilize()) return imm;
+    return pi;
 }
 
-const Def* LamExpr::emit_decl(Emitter& e, const Def*) const { return lam()->emit_decl(e), lam()->def(); }
-void LamExpr::emit_body(Emitter& e, const Def*) const { lam()->emit_body(e); }
+const Def* LamExpr::emit_decl_(Emitter& e, const Def*) const { return lam()->emit_decl(e), lam()->def(); }
+void LamExpr::emit_body_(Emitter& e, const Def*) const { lam()->emit_body(e); }
 
 const Def* LamExpr::emit_(Emitter& e) const {
     auto res = emit_decl(e, {});
@@ -326,27 +774,63 @@ const Def* LamExpr::emit_(Emitter& e) const {
 const Def* AppExpr::emit_(Emitter& e) const {
     auto c = callee()->emit(e);
     auto a = arg()->emit(e);
-    return is_explicit() ? e.world().app(c, a) : e.world().implicit_app(c, a);
+    return e.world().implicit_app(c, a);
 }
 
 const Def* RetExpr::emit_(Emitter& e) const {
-    auto c = callee()->emit(e);
-    if (auto cn = Pi::has_ret_pi(c->type())) {
-        auto con  = e.world().mut_lam(cn);
-        auto pair = e.world().tuple({arg()->emit(e), con});
-        auto app  = e.world().app(c, pair)->set(c->loc() + arg()->loc());
-        ptrn()->emit_value(e, con->var());
-        con->set(false, body()->emit(e));
-        return app;
-    }
+    auto& w = e.world();
+    auto c  = callee()->emit(e);
+    if (auto pi = c->type()->isa<Pi>())
+        if (auto cn = pi->ret_pi()) {
+            auto a = arg()->emit(e);
+            // A dependent domain's ret type refers to the other arguments, so instantiate it with them.
+            if (auto sigma = pi->dom()->isa_mut<Sigma>()) {
+                auto n    = sigma->num_ops();
+                auto args = DefVec(n, [&](size_t i) {
+                    return i + 1 == n ? w.bot(sigma->op(i)) : n == 2 ? a : a->proj(n - 1, i);
+                });
+                if (auto inst = sigma->reduce(w.tuple(args)).back()->isa<Pi>()) cn = inst;
+            }
+            auto con  = w.mut_lam(cn);
+            auto pair = w.tuple({a, con});
+            auto app  = w.app(c, pair);
+            ptrn()->emit_value(e, con->var());
+            con->set(false, body()->emit(e));
+            return app;
+        }
 
-    error(c->loc(), "callee of a ret expression must type as a returning continuation but got '{}' of type '{}'", c,
-          c->type());
+    e.error()
+        .e(callee()->loc(), "callee of a `ret` expression must be a returning continuation, but `{}` has type `{}`", c,
+           c->type())
+        .bail();
 }
 
-const Def* SigmaExpr::emit_decl(Emitter& e, const Def* type) const { return ptrn()->emit_decl(e, type); }
-void SigmaExpr::emit_body(Emitter& e, const Def* decl) const { ptrn()->emit_body(e, decl); }
+const Def* SigmaExpr::emit_decl_(Emitter& e, const Def* type) const { return ptrn()->emit_decl(e, type); }
+void SigmaExpr::emit_body_(Emitter& e, const Def* decl) const { ptrn()->emit_body(e, decl); }
 const Def* SigmaExpr::emit_(Emitter& e) const { return ptrn()->emit_type(e); }
+
+DefVec VariantExpr::emit_payloads(Emitter& e) const {
+    return DefVec(num_ctors(), [&](size_t i) -> const Def* {
+        auto type = ctor(i)->type();
+        return type ? type->emit(e) : e.world().sigma();
+    });
+}
+
+const Def* VariantExpr::emit_(Emitter& e) const {
+    auto variant = e.world().variant(emit_payloads(e));
+    e.add_ctors(variant, this);
+    return variant;
+}
+
+const Def* VariantExpr::emit_decl_(Emitter& e, const Def* type) const {
+    return e.world().mut_variant(type, num_ctors());
+}
+
+void VariantExpr::emit_body_(Emitter& e, const Def* decl) const {
+    auto variant = decl->as_mut<Variant>();
+    variant->set(emit_payloads(e));
+    e.add_ctors(variant, this);
+}
 
 const Def* TupleExpr::emit_(Emitter& e) const {
     DefVec elems(num_elems(), [&](size_t i) { return elem(i)->emit(e); });
@@ -354,148 +838,189 @@ const Def* TupleExpr::emit_(Emitter& e) const {
 }
 
 const Def* SeqExpr::emit_(Emitter& e) const {
-    auto s = arity()->emit_type(e);
-    if (auto lit_s = Lit::isa(s); lit_s && *lit_s == 0) return e.world().unit(is_pack());
+    auto s = shape()->emit(e);
+    if (auto lit_s = Lit::isa(s); lit_s && *lit_s == 0) return e.world().prod(is_pack());
 
-    if (arity()->dbg().is_anon()) { // immutable
+    if (index()->dbg().is_anon()) { // immutable
         auto b = body()->emit(e);
         return e.world().seq(is_pack(), s, b);
     }
 
-    auto t = e.world().type_infer_univ();
-    auto a = e.world().mut_arr(t);
-    a->set_arity(s);
+    auto a = e.world().mut_arr(e.world().type_pending());
+    a->set_shape(s);
 
     if (is_pack()) {
-        auto p   = e.world().mut_pack(a);
+        auto p = e.world().mut_pack(a);
+        p->set_shape(s);
         auto var = p->var();
-        arity()->emit_value(e, var);
+        index()->emit(var);
         auto b = body()->emit(e);
-        p->set(b);
+        p->set_body(b);
         auto arr_b = b->type();
         if (auto pvar = var->isa<Var>())
             // Use array var in array body instead of pack var
             arr_b = VarRewriter(pvar, a->var()).rewrite(arr_b);
         a->set_body(arr_b);
-        if (auto imm = p->immutabilize()) return imm;
-        return p;
+        return e.world().fuse(p);
     } else {
         auto var = a->var();
-        arity()->emit_value(e, var);
+        index()->emit(var);
         a->set_body(body()->emit(e));
-        if (auto imm = a->immutabilize()) return imm;
-        return a;
+        return e.world().fuse(a);
     }
 }
 
-const Def* ExtractExpr::emit_(Emitter& e) const {
-    auto tup = tuple()->emit(e);
-    if (auto dbg = std::get_if<Dbg>(&index())) {
-        if (auto sigma = tup->type()->isa_mut<Sigma>()) {
-            if (auto i = e.sigma2sym2idx.find(sigma); i != e.sigma2sym2idx.end()) {
-                auto sigma          = i->first->as_mut<Sigma>();
-                const auto& sym2idx = i->second;
-                if (auto i = sym2idx.find(dbg->sym()); i != sym2idx.end())
-                    return e.world().extract(tup, sigma->num_ops(), i->second);
-            }
-        }
-
-        if (decl()) return e.world().extract(tup, decl()->def());
-        error(dbg->loc(), "cannot resolve index '{}' for extraction", *dbg);
-    }
-
-    auto expr = std::get<Ptr<Expr>>(index()).get();
-    auto i    = expr->emit(e);
-    return e.world().extract(tup, i);
+const Def* SingleExpr::emit_(Emitter& e) const {
+    auto def = body()->emit(e);
+    return is_wrap() ? e.world().wrap(def) : e.world().single(def);
 }
-
-const Def* InsertExpr::emit_(Emitter& e) const {
-    auto t = tuple()->emit(e);
-    auto i = index()->emit(e);
-    auto v = value()->emit(e);
-    return e.world().insert(t, i, v);
-}
-
-const Def* UniqExpr::emit_(Emitter& e) const { return e.world().uniq(inhabitant()->emit(e)); }
 
 /*
  * Decl
  */
 
 void AxmDecl::emit(Emitter& e) const {
-    if (!annex_) return; // Skip emit if binding failed
-    mim_type_   = type()->emit(e);
-    auto& id    = annex_->id;
-    auto plugin = annex_->plugin_id();
-
-    std::tie(id.curry, id.trip) = Axm::infer_curry_and_trip(mim_type_);
+    auto _                 = e.world().push(loc());
+    auto type              = type_->emit(e);
+    auto [n_curry, n_trip] = Axm::infer_curry_and_trip(type);
+    // An Axm cannot be replaced by the inhabitant, which all other values of a singleton type collapse to.
+    if (e.world().inhabitant(type))
+        e.error().e(type_->loc(), "axiom of singleton type `{}` carries no information", type).bail();
     if (curry_) {
-        if (curry_.lit_u() > id.curry)
-            error(curry_.loc(), "curry counter cannot be greater than {}", id.curry);
+        if (curry_.lit_u() > n_curry)
+            e.error().e(curry_.loc(), "curry counter cannot be greater than {}", n_curry).bail();
         else
-            id.curry = curry_.lit_u();
+            n_curry = curry_.lit_u();
     }
 
     if (trip_) {
-        if (trip_.lit_u() > id.curry)
-            error(trip_.loc(), "trip counter cannot be greater than curry counter '{}'", (int)id.curry);
+        if (trip_.lit_u() > n_curry)
+            e.error().e(trip_.loc(), "trip counter cannot be greater than curry counter {}", (int)n_curry).bail();
         else
-            id.trip = trip_.lit_u();
+            n_trip = trip_.lit_u();
     }
 
-    if (num_subs() == 0) {
-        auto norm = e.driver().normalizer(plugin, id.tag, 0);
-        auto axm  = e.world().axm(norm, id.curry, id.trip, mim_type_, plugin, id.tag, 0)->set(dbg());
-        def_      = axm;
-        e.world().annexes().attach(plugin, id.tag, 0, dbg().sym(), axm);
-    } else {
-        for (sub_t i = 0, n = num_subs(); i != n; ++i) {
-            sub_t s   = i + offset_;
-            auto norm = e.driver().normalizer(plugin, id.tag, s);
-            auto name = e.world().sym(dbg().sym().str() + "."s + sub(i).front()->dbg().sym().str());
-            auto axm  = e.world().axm(norm, id.curry, id.trip, mim_type_, plugin, id.tag, s)->set(name);
-            e.world().annexes().attach(plugin, id.tag, s, name, axm);
-
-            for (const auto& alias : sub(i))
-                alias->def_ = axm;
-        }
+    for (auto name : names()) {
+        auto annex = name->annex_;
+        if (!annex) continue; // binding failed
+        auto plugin = annex->plugin_id();
+        auto tag    = annex->id.tag;
+        auto sub    = name->sub_;
+        auto norm   = e.driver().normalizer(plugin, tag, sub);
+        auto sym    = annex->qualified(e.driver(), name->dbg().sym());
+        auto axm    = e.world().axm(norm, n_curry, n_trip, type, plugin, tag, sub)->set(sym);
+        name->def_  = axm;
+        e.world().annexes().attach(plugin, tag, sub, sym, axm);
+        for (auto alias : name->aliases())
+            e.attach_alias(annex, sub, alias.sym());
     }
+}
+
+void AliasDecl::emit(Emitter& e) const {
+    if (!annex_) return; // skip emit if binding failed
+    auto target = path()->decl();
+    def_        = target->def();
+    if (foreign_)
+        e.world().annexes().attach_alias(annex_->plugin_id(), annex_->id.tag, sub_, foreign_);
+    else
+        e.attach_alias(annex_, sub_, dbg().sym());
+}
+
+void ModDecl::emit_decls(Emitter& e) const {
+    for (auto decl : decls()) {
+        decl->emit(e);
+        e.world().solve_levels();
+    }
+}
+
+void ModDecl::emit(Emitter& e) const {
+    e.push_mod(this);
+    emit_decls(e);
+    e.pop_mod();
 }
 
 void LetDecl::emit(Emitter& e) const {
+    auto _ = e.world().push(loc());
     auto v = value()->emit(e);
     def_   = ptrn()->emit_value(e, v);
-    if (auto id = ptrn()->isa<IdPtrn>()) e.attach(annex_, sub_, id->dbg().sym(), def_);
+    if (auto id = ptrn()->isa<IdPtrn>()) e.attach(id->annex_, id->sub_, id->dbg().sym(), def_);
 }
 
 void RecDecl::emit(Emitter& e) const {
-    for (auto curr = this; curr; curr = curr->next())
-        curr->emit_decl(e);
-    for (auto curr = this; curr; curr = curr->next())
-        curr->emit_body(e);
+    emit_decl(e);
+    emit_body(e);
+}
+
+void MutualDecl::emit(Emitter& e) const {
+    for (auto decl : decls())
+        decl->emit_decl(e);
+    for (auto decl : decls())
+        decl->emit_body(e);
 }
 
 void RecDecl::emit_decl(Emitter& e) const {
-    auto t = type() ? type()->emit(e) : e.world().type_infer_univ();
-    def_   = body()->emit_decl(e, t);
-    def_->set(dbg());
+    auto _ = e.world().push(loc());
+    def_   = body()->emit_decl(e, e.world().type_infer_level());
+    def_->set(dbg().sym());
 }
 
 void RecDecl::emit_body(Emitter& e) const {
+    auto _ = e.world().push(loc());
     body()->emit_body(e, def_);
     // TODO immutabilize?
     e.attach(annex_, sub_, dbg().sym(), def_);
 }
 
+void NomDecl::emit_decl(Emitter& e) const {
+    if (!has_mut_body()) return;
+    auto _ = e.world().push(loc());
+    emit_nom(e, body()->emit_decl(e, e.world().type_infer_level()));
+}
+
+void NomDecl::emit_body(Emitter& e) const {
+    auto _ = e.world().push(loc());
+    if (has_mut_body()) {
+        body()->emit_body(e, def_->as<Nom>()->op());
+    } else {
+        if (def_) return; // see emit_ahead
+        emitting_ = true;
+        emit_nom(e, body()->emit(e));
+    }
+    e.attach(annex_, sub_, dbg().sym(), def_);
+}
+
+const Def* NomDecl::emit_ahead(Emitter& e) const {
+    if (!has_mut_body() && !emitting_) emit_body(e);
+    return def_;
+}
+
+void NomDecl::emit_sugar(Emitter& e, Lam* lam) const {
+    // `I dom` then resolves to this very instance as an application of a Lam to its own Var.
+    emit_decl(e);
+    lam->set_body(emit_ahead(e));
+    emit_body(e);
+}
+
+void NomDecl::emit_nom(Emitter& e, const Def* body) const {
+    // World::dump finds a file's annexes by their qualified sym.
+    auto sym = annex_ ? annex_->qualified(e.driver(), dbg().sym()) : dbg().sym();
+    auto nom = e.world().nom(e.world().next_gid(), body);
+    nom->set(sym);
+    e.add_nom(nom, this);
+    def_ = nom;
+}
+
 Lam* LamDecl::Dom::emit_value(Emitter& e) const {
-    lam_     = e.world().mut_lam(pi_);
-    auto var = lam_->var();
+    // Created before the push: the Lam belongs to the whole declaration, not just to this Dom.
+    lam_   = e.world().mut_lam(pi_);
+    auto _ = e.world().push(loc());
 
     if (ret()) {
-        ptrn()->emit_value(e, var->proj(2, 0));
-        ret()->emit_value(e, var->proj(2, 1));
+        auto var = lam_->var();
+        ptrn()->emit_proj(e, var, 2, 0);
+        ret()->emit(var->proj(2, 1));
     } else {
-        ptrn()->emit_value(e, var);
+        emit_var(e, ptrn(), lam_);
     }
 
     return lam_;
@@ -503,23 +1028,25 @@ Lam* LamDecl::Dom::emit_value(Emitter& e) const {
 
 void LamDecl::emit_decl(Emitter& e) const {
     auto _      = e.world().push(loc());
-    bool is_cps = tag_ == Tag::K_cn || tag_ == Tag::K_con || tag_ == Tag::K_fn || tag_ == Tag::K_fun;
+    bool is_cps = !ISA(tag_, C_DS);
 
     // Iterate over all doms: Build a Lam for curr dom, by first building a curried Pi for the remaining doms.
     for (size_t i = 0, n = num_doms(); i != n; ++i) {
-        for (const auto& dom : doms() | std::views::drop(i))
+        for (auto dom : doms() | std::views::drop(i))
             dom->emit_type(e);
 
         auto cod = codom() ? codom()->emit(e) : is_cps ? e.world().type_bot() : e.world().mut_hole_type();
-        for (const auto& dom : doms() | std::views::drop(i) | std::views::reverse)
+        for (auto dom : doms() | std::views::drop(i) | std::views::reverse)
             cod = dom->pi_->set_codom(cod);
 
-        auto cur    = dom(i);
-        auto lam    = cur->emit_value(e);
-        auto filter = cur->filter()        ? cur->filter()->emit(e)
-                    : i + 1 == n && is_cps ? e.world().lit_ff()
-                                           : e.world().lit_tt();
-        lam->set_filter(filter);
+        auto cur = dom(i);
+        auto lam = cur->emit_value(e);
+        if (auto filter = cur->filter()) {
+            auto _filter = e.world().push(filter->loc());
+            lam->set_filter(filter->emit(e));
+        } else {
+            lam->set_filter(i + 1 == n && is_cps ? e.world().lit_ff() : e.world().lit_tt());
+        }
 
         if (i == 0)
             def_ = lam->set(dbg().sym());
@@ -529,25 +1056,36 @@ void LamDecl::emit_decl(Emitter& e) const {
 }
 
 void LamDecl::emit_body(Emitter& e) const {
-    auto b = body()->emit(e);
-    doms().back()->lam_->set_body(b);
+    if (!body()) return; // extern forward declaration: the implementation lives in a native translation unit
+
+    auto _ = e.world().push(loc());
+    {
+        auto _body = e.world().push(body()->loc());
+        auto lam   = doms().back()->lam_;
+        if (auto nom = nom_sugar())
+            nom->emit_sugar(e, lam);
+        else
+            lam->set_body(body()->emit(e));
+    }
 
     // rewrite holes
     for (size_t i = 0, n = num_doms(); i != n; ++i) {
         auto rw  = VarRewriter(e.world());
         auto lam = dom(i)->lam_;
         auto pi  = lam->type()->as_mut<Pi>();
-        for (const auto& dom : doms() | std::views::drop(i)) {
-            if (auto var = pi->has_var()) rw.add(dom->lam_->var()->as<Var>(), var);
+        for (auto dom : doms() | std::views::drop(i)) {
+            // A Lam's Var that was never created cannot occur in the codomain.
+            if (auto var = pi->has_var())
+                if (auto lam_var = dom->lam_->has_var()) rw.add(lam_var, var);
             auto cod = pi->codom();
             if (!cod || !cod->isa_mut<Pi>()) break;
             pi = cod->as_mut<Pi>();
         }
 
-        if (auto cod = pi->codom(); cod && cod->has_dep(Dep::Hole)) pi->set(pi->dom(), rw.rewrite(cod));
+        if (auto cod = pi->codom(); cod && cod->has_hole()) pi->set(pi->dom(), rw.rewrite(cod));
     }
 
-    for (const auto& dom : doms() | std::views::reverse) {
+    for (auto dom : doms() | std::views::reverse) {
         if (auto imm = dom->pi_->immutabilize()) {
             auto f = dom->lam_->filter();
             auto b = dom->lam_->body();
@@ -555,27 +1093,24 @@ void LamDecl::emit_body(Emitter& e) const {
         }
     }
 
-    if (is_external()) {
+    if (is_extern()) {
         auto lam = doms().front()->lam_;
         if (!lam->is_closed())
-            error(loc(),
-                  "external function '{}' is not closed: its inferred type escapes into the scope of '{}'. This "
-                  "usually means an unannotated parameter's type could only be inferred to depend on a variable bound "
-                  "in an inner/sibling scope; add an explicit type annotation to the offending parameter.",
-                  dbg().sym(), (*lam->free_vars().begin())->binder()->sym());
+            e.error()
+                .e(loc(),
+                   "external function `{}` is not closed: its inferred type escapes into the scope of `{}`. This "
+                   "usually means an unannotated parameter's type could only be inferred to depend on a variable bound "
+                   "in an inner/sibling scope; add an explicit type annotation to the offending parameter.",
+                   dbg().sym(), lam->free_vars().min()->binder()->sym())
+                .bail();
+        if (auto prev = e.world().externals()[dbg().sym()])
+            e.error()
+                .e(loc(), "external function `{}` is already defined", dbg().sym())
+                .n(prev->loc(), "previous definition here")
+                .bail();
         lam->externalize();
     }
     e.attach(annex_, sub_, dbg().sym(), def_);
-}
-
-void CDecl::emit(Emitter& e) const {
-    auto dom_t = dom()->emit_type(e);
-    if (tag() == Tag::K_cfun) {
-        auto ret_t = codom()->emit(e);
-        def_       = e.world().mut_fun(dom_t, ret_t)->set(dbg());
-    } else {
-        def_ = e.world().mut_con(dom_t)->set(dbg());
-    }
 }
 
 void RuleDecl::emit(Emitter& e) const {

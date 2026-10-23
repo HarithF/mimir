@@ -1,17 +1,15 @@
 #pragma once
 
-#include "mim/phase.h"
+#include <mim/phase.h>
 
 #include "mim/plug/gpu/gpu.h"
 
 namespace mim::plug::gpu::phase {
 
+/// Afterwards, old_world() is the host, which keeps each kernel as a declaration, and new_world() the device.
 class SplitOffKernels : public RWPhase {
 public:
-    SplitOffKernels(World& world, flags_t annex)
-        : RWPhase(world, annex) {}
-    SplitOffKernels(World& world, std::string name)
-        : RWPhase(world, std::move(name)) {}
+    using RWPhase::RWPhase;
 
 private:
     void start() final;

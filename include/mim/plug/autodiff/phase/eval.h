@@ -3,14 +3,13 @@
 #include <mim/def.h>
 #include <mim/phase.h>
 
-namespace mim::plug::autodiff {
+namespace mim::plug::autodiff::phase {
 
 /// This phase is the heart of AD.
 /// We replace an `autodiff fun` call with the differentiated function.
 class Eval : public RWPhase {
 public:
-    Eval(World& world, flags_t annex)
-        : RWPhase(world, annex) {}
+    using RWPhase::RWPhase;
 
     /// Detect autodiff calls.
     const Def* rewrite_imm_App(const App*) final;
@@ -37,9 +36,11 @@ public:
     const Def* augment_lit(const Lit*, Lam*, Lam*);
     const Def* augment_tuple(const Tuple*, Lam*, Lam*);
     const Def* augment_pack(const Pack* pack, Lam* f, Lam* f_diff);
+    /// The partial pullback of @p aug in the closed function @p f.
+    const Def* pullback(const Def* aug, Lam* f);
 
 private:
-    /// derive()/augment() run entirely in the new world: the `%autodiff.ad` argument is rewritten first, and the
+    /// derive()/augment() run entirely in the new world: the `autodiff.ad` argument is rewritten first, and the
     /// derivative is built from that copy. This alias resolves the world() calls in the augment machinery accordingly.
     World& world() { return new_world(); }
 
@@ -81,4 +82,4 @@ private:
     Def2Def shadow_pullback;
 };
 
-} // namespace mim::plug::autodiff
+} // namespace mim::plug::autodiff::phase

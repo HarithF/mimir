@@ -1,0 +1,74 @@
+/* Token colours for the EBNF blocks of the language reference; EbnfCode in ebnf.js emits these classes. */
+html {
+    --ebnf-rule: #2b7ab3;
+    --ebnf-token: #45195c;
+    --ebnf-terminal: #ac5b53;
+    --ebnf-terminal-background: rgba(224, 127, 65, .12);
+    --ebnf-meta: #878787;
+    --ebnf-trace: rgba(0, 145, 200, .22);
+}
+
+@media (prefers-color-scheme: dark) {
+    html:not(.light-mode) {
+        --ebnf-rule: #50a5d2;
+        --ebnf-token: #c49be0;
+        --ebnf-terminal: #fda642;
+        --ebnf-terminal-background: rgba(253, 166, 66, .14);
+        --ebnf-meta: #878787;
+        --ebnf-trace: rgba(80, 165, 210, .22);
+    }
+}
+
+/* Dark mode variables are defined twice, to support it with and without doxygen-awesome-darkmode-toggle.js. */
+html.dark-mode {
+    --ebnf-rule: #50a5d2;
+    --ebnf-token: #c49be0;
+    --ebnf-terminal: #fda642;
+    --ebnf-terminal-background: rgba(253, 166, 66, .14);
+    --ebnf-meta: #878787;
+    --ebnf-trace: rgba(80, 165, 210, .22);
+}
+
+.ebnf-rule {
+    color: var(--ebnf-rule);
+    cursor: pointer;
+}
+
+.ebnf-token {
+    color: var(--ebnf-token);
+    cursor: pointer;
+}
+
+.ebnf-rule:hover,
+.ebnf-token:hover {
+    text-decoration: underline dotted;
+}
+
+.ebnf-def {
+    font-weight: bold;
+}
+
+.ebnf-terminal {
+    color: var(--ebnf-terminal);
+    background: var(--ebnf-terminal-background);
+    border-radius: 3px;
+    padding: .08em .2em;
+}
+
+.ebnf-class {
+    color: var(--ebnf-terminal);
+}
+
+.ebnf-meta {
+    color: var(--ebnf-meta);
+}
+
+/* The quotes stay in the DOM so that copying a block yields the source notation again. */
+.ebnf-quote {
+    display: none;
+}
+
+.ebnf-trace {
+    background: var(--ebnf-trace);
+    border-radius: 3px;
+}

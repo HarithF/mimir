@@ -1,18 +1,6 @@
-[submodule "abseil-cpp"]
-	path = submodules/abseil-cpp
-	url = ../../abseil/abseil-cpp
-[submodule "doxygen-awesome-css"]
-	path = submodules/doxygen-awesome-css
-	url = ../../jothepro/doxygen-awesome-css.git
 [submodule "fe"]
 	path = submodules/fe
 	url = ../../leissa/fe.git
-[submodule "googletest"]
-	path = submodules/googletest
-	url = ../../google/googletest.git
-[submodule "lyra"]
-	path = submodules/lyra
-	url = ../../bfgroup/lyra.git
 [submodule "submodules/nanobind"]
 	path = submodules/nanobind
 	url = ../../wjakob/nanobind.git

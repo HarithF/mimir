@@ -1,0 +1,15 @@
+// RUN: rm -f %{s:stem}.ll
+// RUN: %mim -p ll %s
+// RUN: clang %S/lib.c %{s:stem}.ll -o %t -Wno-override-module
+// RUN: %t | %FileCheck %s
+plugin core;
+plugin mem;
+
+extern fun println_str[mem.M 0, mem.Ptr0 mem.Char]: mem.M 0;
+
+extern fun main(m: mem.M 0, argc: I32, argv: mem.Ptr0 «core.idx2nat argc; mem.Ptr0 mem.Char»): [mem.M 0, I32] =
+    ret (m, p) = mem.slot («13; mem.Char», 0) $ m;
+    let m      = mem.store (m, p, "Hello World!\0");
+    ret m      = println_str $ (m, mem.decay p);
+    return (m, 0I32);
+// CHECK: Hello World!

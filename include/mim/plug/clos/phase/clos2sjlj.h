@@ -6,20 +6,20 @@
 
 #include "mim/plug/clos/clos.h"
 
-namespace mim::plug::clos {
+namespace mim::plug::clos::phase {
 
 /// Lowers basicblock closures that are passed as arguments (i.e. exception continuations)
 /// to setjmp/longjmp: the caller setjmps and dispatches on the tag, the closures become longjmps.
 class Clos2SJLJ : public RWPhase {
 public:
-    Clos2SJLJ(World& world, flags_t annex)
-        : RWPhase(world, annex) {}
+    using RWPhase::RWPhase;
 
 private:
+    const Def* rewrite(const Def*) final;
     const Def* rewrite_mut_Lam(Lam*) final;
 
-    /// Restructures the (already rewritten, new-world) @p lam if its body passes exception closures.
-    void convert(Lam* lam);
+    /// Restructures the rewritten @p filter and @p body of @p lam if @p body passes exception closures.
+    std::pair<const Def*, const Def*> convert(Lam* lam, const Def* filter, const Def* body);
 
     const Def* void_ptr() { return new_world().annex<clos::BufPtr>(); }
     const Def* jb_type() { return void_ptr(); }
@@ -29,9 +29,11 @@ private:
     Lam* get_throw(const Def* res_type);
     Lam* get_lpad(Lam* lam, const Def* rb);
 
-    void get_exn_closures(Lam* lam);
+    void get_exn_closures(const Def* body);
     void get_exn_closures(const Def* def, DefSet& visited);
-    const Def* subst_exn_closures(const Def* def, Def2Def& memo);
+
+    /// Substitutes closure literals of tagged exception Lam%s by throw closures; does not descend into mutables.
+    const Def* subst_exn_closures(const Def* def);
 
     // clang-format off
     LamMap<std::pair<int, const Def*>> lam2tag_;
@@ -44,4 +46,4 @@ private:
     const Def* cur_jbuf_ = nullptr;
 };
 
-} // namespace mim::plug::clos
+} // namespace mim::plug::clos::phase

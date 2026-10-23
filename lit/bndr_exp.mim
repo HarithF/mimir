@@ -1,0 +1,3 @@
+// RUN: %mim -p opt %s
+
+mod foo axm bar: [[Nat, Nat] → Nat]; end

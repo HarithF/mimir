@@ -1,13 +1,15 @@
 #pragma once
 
-#include <memory>
+#include <fe/restore.h>
 
 #include "mim/check.h"
 #include "mim/def.h"
 #include "mim/lam.h"
-#include "mim/lattice.h"
+#include "mim/nom.h"
 #include "mim/rule.h"
+#include "mim/single.h"
 #include "mim/tuple.h"
+#include "mim/union.h"
 
 namespace mim {
 
@@ -20,11 +22,9 @@ class Rewriter {
 public:
     /// @name Construction & Destruction
     ///@{
-    Rewriter(std::unique_ptr<World>&& ptr);
     Rewriter(World& world);
     virtual ~Rewriter();
 
-    void reset(std::unique_ptr<World>&& ptr);
     void reset();
     ///@}
 
@@ -33,16 +33,27 @@ public:
     World& world() { return *world_; }
     ///@}
 
-    /// @name Push / Pop
+    /// @name Scope
     ///@{
-    virtual void push() { old2news_.emplace_back(Def2Def{}); }
-    virtual void pop() { old2news_.pop_back(); }
+    /// Opens a scope for the mappings whose old Def depends on @p old_vars or whose new Def depends on @p new_vars.
+    /// The root scope takes all others.
+    void push(Vars old_vars = {}, Vars new_vars = {}) { scopes_.emplace_back(old_vars, new_vars); }
+    void pop() { scopes_.pop_back(); }
+    /// Adds the old @p var - if any - to the innermost scope.
+    void bind_old(const Var* var);
+    /// Adds the new @p var - if any - to the innermost scope.
+    void bind_new(const Var* var);
+    void bind(const Var* old_var, const Var* new_var) {
+        bind_old(old_var);
+        bind_new(new_var);
+    }
     ///@}
 
     /// @name Map / Lookup
     /// Map @p old_def to @p new_def and returns @p new_def.
     ///@{
-    virtual const Def* map(const Def* old_def, const Def* new_def) { return old2news_.back()[old_def] = new_def; }
+    /// Records the mapping in the innermost push() scope it depends on.
+    const Def* map(const Def* old_def, const Def* new_def);
 
     // clang-format off
     const Def* map(const Def* old_def ,       Defs new_defs);
@@ -53,8 +64,8 @@ public:
     /// Lookup `old_def` by searching in reverse through the stack of maps.
     /// @returns `nullptr` if nothing was found.
     virtual const Def* lookup(const Def* old_def) {
-        for (const auto& old2new : old2news_ | std::views::reverse)
-            if (auto i = old2new.find(old_def); i != old2new.end()) return i->second;
+        for (const auto& scope : scopes_ | std::views::reverse)
+            if (auto new_def = fe::lookup(scope.old2new, old_def)) return new_def;
         return nullptr;
     }
     ///@}
@@ -66,6 +77,10 @@ public:
     virtual const Def* rewrite_imm(const Def*);
     virtual const Def* rewrite_mut(Def*);
     virtual const Def* rewrite_stub(Def*, Def*);
+    /// Like above, but @p new_mut may have a *different* number of ops than @p old_mut:
+    /// `new_mut->op(i)` is rewritten from `old_mut->op(new2old[i])`.
+    /// This is what a Phase needs that reshapes an aggregate; @see Sieve.
+    const Def* rewrite_stub(Def* old_mut, Def* new_mut, fe::View<size_t> new2old);
     virtual DefVec rewrite(Defs);
 
 #define CODE_IMM(N) virtual const Def* rewrite_imm_##N(const N*);
@@ -79,42 +94,47 @@ public:
     virtual const Def* rewrite_mut_Seq(Seq* seq);
     ///@}
 
-    friend void swap(Rewriter& rw1, Rewriter& rw2) noexcept {
-        using std::swap;
-        swap(rw1.old2news_, rw2.old2news_);
-        // Do NOT swap ptr_ and world_: they are back pointers!
-    }
-
     template<class D = Def>
     D* curr_mut() const {
         return curr_mut_ ? curr_mut_->template isa<D>() : nullptr;
     }
 
+protected:
+    /// The map of the innermost push() scope.
+    Def2Def& old2new() { return scopes_.back().old2new; }
+
+    /// Does @p old_def depend on the old Vars of any scope?
+    bool has_intersection(const Def* old_def) {
+        // Def::has_free_vars_in avoids materializing old_def's merged free_vars() - once per level, at that.
+        for (const auto& scope : scopes_ | std::views::reverse)
+            if (old_def->has_free_vars_in(scope.old_vars)) return true;
+        return false;
+    }
+
+    /// Updates curr_mut() to @p new_mut and restores it at the end of the scope.
+    [[nodiscard]] auto enter(Def* new_mut) { return fe::Restore(curr_mut_, new_mut); }
+
+    /// The tail of rewrite_stub: immutabilizes @p new_mut in hindsight, as rewriting may have made it vacuous.
+    /// A stub that already has users stays mutable, as the users captured it during its own rewrite.
+    /// Only needed if you fill a stub yourself instead of going through rewrite_stub.
+    const Def* seal(Def* old_mut, Def* new_mut);
+
+    struct Scope {
+        Vars old_vars; ///< Only mappings depending on these go here; the root's are VarRewriter's substitutions.
+        Vars new_vars;
+        Def2Def old2new;
+    };
+    fe::Vector<Scope> scopes_;
+
 private:
-    std::unique_ptr<World> ptr_;
     World* world_;
     Def* curr_mut_ = nullptr;
 
-protected:
-    std::deque<Def2Def> old2news_;
-
-    /// Helps to keep track of curr_mut().
-    /// @see enter()
-    class Enter {
-    public:
-        Enter(Rewriter* rewriter, Def* new_mut)
-            : rewriter_(rewriter)
-            , prev_mut_(rewriter->curr_mut()) {
-            rewriter->curr_mut_ = new_mut;
-        }
-        ~Enter() { rewriter_->curr_mut_ = prev_mut_; }
-
-    private:
-        Rewriter* rewriter_;
-        Def* prev_mut_;
-    };
-
-    Enter enter(Def* new_mut) { return {this, new_mut}; } //< Updates curr_mut() to @p new_mut.
+    friend void swap(Rewriter& rw1, Rewriter& rw2) noexcept {
+        using std::swap;
+        swap(rw1.scopes_, rw2.scopes_);
+        // Do NOT swap world_: it is a back pointer!
+    }
 };
 
 /// Extends Rewriter for variable substitution.
@@ -130,18 +150,12 @@ public:
         add(var, arg);
     }
 
-    // Add initial mapping from @pvar -> @p arg.
+    /// Substitutes @p arg for @p var.
     VarRewriter& add(const Var* var, const Def* arg) {
         map(var, arg);
-        vars_.emplace_back(var);
+        bind_old(var);
         return *this;
     }
-    ///@}
-
-    /// @name push / pop
-    ///@{
-    void push() final { Rewriter::push(), vars_.emplace_back(Vars()); }
-    void pop() final { vars_.pop_back(), Rewriter::pop(); }
     ///@}
 
     /// @name rewrite
@@ -153,17 +167,7 @@ public:
     friend void swap(VarRewriter& vrw1, VarRewriter& vrw2) noexcept {
         using std::swap;
         swap(static_cast<Rewriter&>(vrw1), static_cast<Rewriter&>(vrw2));
-        swap(vrw1.vars_, vrw2.vars_);
     }
-
-private:
-    bool has_intersection(const Def* old_def) {
-        for (const auto& vars : vars_ | std::views::reverse)
-            if (vars.has_intersection(old_def->free_vars())) return true;
-        return false;
-    }
-
-    Vector<Vars> vars_;
 };
 
 class Zonker : public Rewriter {
@@ -174,11 +178,7 @@ public:
         : Rewriter(world) {}
     ///@}
 
-    /// @name Stack of Maps
-    ///@{
-    const Def* map(const Def* old_def, const Def* new_def) final;
     const Def* lookup(const Def* old_def) final;
-    ///@}
 
     /// @name rewrite
     ///@{
@@ -191,12 +191,20 @@ public:
         using std::swap;
         swap(static_cast<Rewriter&>(z1), static_cast<Rewriter&>(z2));
     }
+};
 
-private:
-    const Def* get(const Def* old_def) {
-        auto& old2new = old2news_.back();
-        if (auto i = old2new.find(old_def); i != old2new.end()) return i->second;
-        return nullptr;
+/// Imports from Driver::library: an annex therein is looked up via World::annex, so it is imported only once.
+class Importer : public Rewriter {
+public:
+    Importer(World& world)
+        : Rewriter(world) {}
+
+    const Def* import(const Def* root) { return Rewriter::rewrite(root); }
+    const Def* rewrite(const Def*) final;
+
+    friend void swap(Importer& i1, Importer& i2) noexcept {
+        using std::swap;
+        swap(static_cast<Rewriter&>(i1), static_cast<Rewriter&>(i2));
     }
 };
 

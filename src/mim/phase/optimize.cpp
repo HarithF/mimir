@@ -6,6 +6,8 @@
 namespace mim {
 
 void optimize(World& world) {
+    world.driver().move_to_library(world);
+
     // clang-format off
     auto compilation_functions = {
         world.sym("_compile"),
@@ -21,10 +23,10 @@ void optimize(World& world) {
         }
     }
 
-    // make all functions `[] -> %compile.Phase` internal
+    // make all functions `[] -> compile.Phase` internal
     for (auto def : world.externals().mutate()) {
         if (auto lam = def->isa<Lam>(); lam && lam->num_doms() == 0) {
-            if (lam->codom()->sym().view() == "%compile.Phase") {
+            if (lam->codom()->sym().view() == "compile.Phase") {
                 if (!compilation) compilation = lam;
                 def->internalize();
             }
@@ -32,21 +34,12 @@ void optimize(World& world) {
     }
 
     if (!compilation) {
-        world.ILOG("no compilation function found - skipping optimization");
+        world.log().i("no compilation function found; skipping optimization");
     } else {
-        world.DLOG("compilation using {} : {}", compilation, compilation->type());
+        world.log().d("compile with {}: {}", compilation, compilation->type());
 
-        auto body   = compilation->as<Lam>()->body();
-        auto callee = App::uncurry_callee(body);
-
-        world.DLOG("Building pipeline");
-        if (auto f = world.driver().phase(callee->flags())) {
-            auto stage = (*f)(world);
-            auto phase = stage.get()->as<Phase>();
-            if (auto app = body->isa<App>()) phase->apply(app);
-            phase->run();
-        } else
-            world.ELOG("axm not found in passes");
+        world.log().d("build pipeline");
+        if (auto phase = Phase::create(world.driver().phases(), compilation->as<Lam>()->body())) phase->run();
     }
 }
 

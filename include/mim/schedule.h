@@ -27,11 +27,10 @@ private:
 };
 
 struct UseHash {
+    using is_avalanching = void;
+
     inline size_t operator()(Use use) const {
-        if constexpr (sizeof(size_t) == 8)
-            return hash((u64(use.index())) << 32_u64 | u64(use->gid()));
-        else
-            return hash_combine(hash_begin(u16(use.index())), use->gid());
+        return fe::hash_combine(0, u64(use.index()) << 32_u64 | u64(use->gid()));
     }
 };
 
@@ -39,7 +38,7 @@ struct UseEq {
     bool operator()(Use u1, Use u2) const { return u1 == u2; }
 };
 
-using Uses = absl::flat_hash_set<Use, UseHash, UseEq>;
+using Uses = ankerl::unordered_dense::set<Use, UseHash, UseEq>;
 
 class Scheduler {
 public:
@@ -61,7 +60,7 @@ public:
     const Nest& nest() const { return *nest_; }
     Def* root() const { return nest_->root()->mut(); }
     const Uses& uses(const Def* def) const {
-        if (auto i = def2uses_.find(def); i != def2uses_.end()) return i->second;
+        if (auto uses = fe::lookup(def2uses_, def)) return *uses;
         return empty_;
     }
     ///@}
@@ -76,7 +75,7 @@ public:
     /// @name Schedule Mutabales
     /// Order of Mutables within a Scope.
     ///@{
-    using Schedule = Vector<Def*>;
+    using Schedule = fe::Vector<Def*>;
     static Schedule schedule(const Nest&);
     ///@}
 

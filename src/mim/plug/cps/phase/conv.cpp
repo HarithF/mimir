@@ -12,19 +12,14 @@ static bool convertible(Lam* lam) {
     return !codom->isa<Type>() && !codom->isa<Pi>();
 }
 
-const Def* Conv::map(const Def* old_def, const Def* new_def) {
-    auto& old2new           = new_def->free_vars().has_intersection(scoped_) ? old2news_.back() : old2news_.front();
-    return old2new[old_def] = new_def;
-}
-
 const Def* Conv::rewrite_mut_Lam(Lam* old_lam) {
-    if (!is_bootstrapping() && convertible(old_lam)) return convert(old_lam);
+    if (convertible(old_lam)) return convert(old_lam);
 
     auto new_lam = new_world().mut_lam(rewrite(old_lam->type())->as<Pi>());
     map(old_lam, new_lam);
     if (!old_lam->is_set()) return new_lam;
 
-    auto scope      = Scope(*this, !is_bootstrapping() && Lam::isa_cn(old_lam));
+    auto scope      = Scope(*this, Lam::isa_cn(old_lam));
     auto new_filter = rewrite(old_lam->filter());
     auto new_body   = wire(scope.base(), rewrite(old_lam->body()));
     return new_lam->set(new_filter, new_body);
@@ -40,8 +35,7 @@ const Def* Conv::convert(Lam* old_lam) {
         // dependent codom: bind it against a fresh mutable Sigma [a: A, Cn B[old_var → a]]
         auto sigma = w.mut_sigma(2);
         sigma->var();
-        scoped_ = w.vars().insert(scoped_, sigma->has_var());
-        push();
+        push({}, Vars(sigma->has_var()));
         map(old_var, sigma->var(2, 0));
         auto new_codom = rewrite(old_pi->codom());
         pop();
@@ -51,13 +45,13 @@ const Def* Conv::convert(Lam* old_lam) {
     } else {
         new_lam = w.mut_fun(new_dom, rewrite(old_pi->codom()));
     }
-    new_lam->set(old_lam->dbg())->debug_suffix("_cps");
+    new_lam->set(old_lam->dbg_key())->debug_suffix("_cps");
 
     auto [param, ret] = new_lam->vars<2>();
     map(old_lam->var(), param);
     auto wrapper = map(old_lam, op_cps2ds_dep(new_lam));
 
-    DLOG("convert {}: {} ↝ {}: {}", old_lam, old_pi, new_lam, new_lam->type());
+    log().d("convert {}: {} → {}: {}", old_lam, old_pi, new_lam, new_lam->type());
 
     auto scope      = Scope(*this, true);
     auto new_filter = rewrite(old_lam->filter());
@@ -82,10 +76,10 @@ const Def* Conv::lift(const Def* k, const Def* new_arg, const App* old_app) {
     auto cont = w.mut_con(rewrite(old_app->type()))->set_filter(false);
     auto res  = cont->var();
     cont->set(w.append_suffix(k->sym(), "_cont"));
-    scoped_ = w.vars().insert(scoped_, cont->has_var());
+    bind_new(cont->has_var());
     pending_.emplace_back(k, new_arg, cont);
 
-    DLOG("lift {} ↝ {} ({}, {})", old_app, k, new_arg, cont);
+    log().d("lift {} → {} ({}, {})", old_app, k, new_arg, cont);
 
     return res;
 }
@@ -96,7 +90,7 @@ const Def* Conv::wire(size_t base, const Def* body) {
         auto [callee, arg, cont] = pending_.back();
         pending_.pop_back();
         cont->set_body(body);
-        body = w.app(callee, w.tuple({arg, cont}));
+        body = w.app(callee, Defs{arg, cont});
     }
     return body;
 }

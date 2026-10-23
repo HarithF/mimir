@@ -9,14 +9,6 @@
 using namespace automaton;
 
 namespace {
-#if 0
-void print_set(const DFASet& set) {
-    std::cout << "{";
-    for (auto state : set) std::cout << state->id() << ", ";
-    std::cout << "}\n";
-}
-#endif
-
 DFASet get_accepting_states(const DFASet& reachableStates) {
     DFASet acceptingStates;
     for (auto state : reachableStates)
@@ -59,17 +51,14 @@ std::vector<DFASet> hopcroft(const DFASet& reachableStates) {
 
     assert((F * E).empty() && "F and E must be disjoint");
 
-    std::vector<DFASet> P = {F, E, reachableStates - F - E};
-    std::vector<DFASet> W = {F, E, reachableStates - F - E};
+    // An empty block would never split and so end up as an orphan state.
+    auto P = std::vector<DFASet>();
+    for (auto&& S : {F, E, reachableStates - F - E})
+        if (!S.empty()) P.push_back(S);
+    auto W = P;
 
     std::vector<DFASet> newP;
     while (!W.empty()) {
-#if 0
-        std::cout << "P: ";
-        for (const auto& S : P) print_set(S);
-        std::cout << "W: ";
-        for (const auto& S : W) print_set(S);
-#endif
         auto A = W.back();
         W.pop_back();
         for (auto c : alphabet) {
@@ -127,11 +116,9 @@ std::unique_ptr<DFA> minimize_dfa(const DFA& dfa) {
     }
     minDfa->set_start(dfaStates[dfa.get_start()]);
     for (auto& X : P) {
-        if (!X.empty()) {
-            auto state = dfaStates[*X.begin()];
-            for (auto x : X)
-                x->for_transitions([&](auto c, auto to) { state->add_transition(dfaStates[to], c); });
-        }
+        auto state = dfaStates[*X.begin()];
+        for (auto x : X)
+            x->for_transitions([&](auto c, auto to) { state->add_transition(dfaStates[to], c); });
     }
     return minDfa;
 }

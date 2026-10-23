@@ -1,20 +1,41 @@
-// RUN: %mim -p opt %s --profile summary                 | %FileCheck %s --check-prefix=FLAT
-// RUN: %mim -p opt %s --output-profile - --profile tree | %FileCheck %s --check-prefix=TREE
+// RUN: %mim -p opt %s --profile summary                    | %FileCheck %s --check-prefix=FLAT
+// RUN: %mim -p opt %s --profile summary --output-profile - | %FileCheck %s --check-prefix=FLAT
+// RUN: %mim -p opt %s --output-profile - --profile tree    | %FileCheck %s --check-prefix=TREE
+// RUN: %mim -p opt %s --profile tree --output-profile -    | %FileCheck %s --check-prefix=TREE
+// RUN: %mim -p opt %s --output-profile -                   | %FileCheck %s --check-prefix=TRACE
+// RUN: (! %mim -p opt %s --profile bogus 2>&1)             | %FileCheck %s --check-prefix=BOGUS
+// RUN: (! %mim -p opt %s --output-profile %t.dir/nope.json 2>&1) | %FileCheck %s --check-prefix=NOOPEN
 // RUN: %mim -p opt %s --output-profile %t.json
 // RUN: %FileCheck %s --check-prefix=TRACE < %t.json
+
+// Both options default the other, so either order must select the same mode.
+
 plugin core;
 
-lam extern f(): «3; Nat» = ‹i: 3; %core.nat.add (1, %core.bitcast Nat i)›;
+use core.ops.n;
 
-// FLAT:      Phase profile (flat):
-// FLAT-NEXT: {{.*}}total{{.*}}self{{.*}}phase
-// FLAT:      {{.*}}cleanup
+extern lam f(): «3; Nat» = ‹i: 3; 1 + core.idx2nat i›;
+
+// FLAT:      Profile (flat):
+// FLAT-NEXT: {{.*}}total{{.*}}self{{.*}}name
 // FLAT:      {{.*}}TOTAL
 
-// TREE:      Phase profile (tree):
-// TREE-NEXT: {{.*}}total{{.*}}self{{.*}}phase
-// TREE:      {{.*}}cleanup
+// The counters are aggregated in an ordered map, so they come out sorted by (phase, counter):
+// each phase's counters are contiguous and the phases themselves ascend.
+// Aggregating in a hash map instead scatters both.
+// FLAT:      Counters:
+// FLAT:      {{[0-9]+}}  `ADCE::Analysis`: `muts.drained`
+// FLAT-NEXT: {{[0-9]+}}  `ADCE::Analysis`: `rounds.full`
+// FLAT:      {{[0-9]+}}  `compile.adce`: `rw.defs`
+// FLAT:      {{[0-9]+}}  `mem.{{[a-z_.0-9]*}}`: `rw.defs`
+
+// TREE:      Profile (tree):
+// TREE-NEXT: {{.*}}total{{.*}}self{{.*}}name
 // TREE:      {{.*}}TOTAL
 
 // TRACE:      {{.*}}"traceEvents"
 // TRACE:      {{.*}}"ph":"X"{{.*}}"dur":
+
+// BOGUS: 'bogus' is not a profile mode
+
+// NOOPEN: error: cannot open output file

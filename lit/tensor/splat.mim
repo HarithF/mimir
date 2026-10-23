@@ -1,0 +1,40 @@
+// RUN: %mim %s -p opt -o - | %FileCheck %s --implicit-check-not=%tensor.splat
+
+// Static and symbolic non-scalar splats become buffer fills. A tensor whose
+// singleton axes fully fold to physical rank zero is represented by its scalar
+// value and disappears during lowering.
+// CHECK-LABEL: extern fun splat_dynamic
+// CHECK: return value;
+// CHECK-LABEL: extern fun splat_physical_rank0
+// CHECK: return 11I32;
+// CHECK-LABEL: extern fun splat_static
+// CHECK: buffer.lit
+// CHECK-LABEL: extern fun splat_static_f32
+// CHECK: buffer.lit (2, (2, 3), math.F (23, 8)) ({{.*}}, 1065353216:(math.F (23, 8)))
+
+plugin tensor;
+plugin compile;
+plugin math;
+
+use tensor;
+
+let F32 = math.F32;
+
+extern fun splat_static(): «2, 3; I32» =
+    return (splat ((2, 3), 7I32));
+
+extern fun splat_static_f32(): «2, 3; F32» =
+    return (splat ((2, 3), 1.0:F32));
+
+extern fun splat_physical_rank0(): I32 =
+    return (splat ((1, 1), 11I32));
+
+extern fun splat_dynamic {n: Nat} (index: Idx n, value: I32): I32 =
+    let t = splat ((n, 2), value);
+    return (t#(index, 0_2));
+
+extern lam _compile (): compile.Phase =
+    compile.phases ff (
+        tensor.lower_to_mem,
+        compile.cleanup,
+    );

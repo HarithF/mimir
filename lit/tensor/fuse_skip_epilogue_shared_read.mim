@@ -1,0 +1,36 @@
+// RUN: %mim -p opt %s -o - | %FileCheck %s
+
+// Like fuse_skip_epilogue_shared, but the sharing hides behind a pure copy: the product's only
+// direct consumer is the reshape, whose read BOTH trailing maps bypass via read-through. The
+// old-world count sees one consumer, so the guard must track multiplicity through the bypassed
+// shared read — otherwise each map sinks into the product and the reduction runs twice. Expected:
+// the copy dies, both maps read the product directly, all three ops stay separate.
+plugin core;
+plugin tensor;
+plugin compile;
+
+use core.ops.n;
+use tensor;
+
+lam add1 (x: Nat): Nat = x + 1;
+lam dbl (x: Nat): Nat = x * 2;
+
+let Ring = (Nat, 0, core.nat.add, core.nat.mul);
+
+let `* = product_2d Ring;
+
+extern con f (a: «2, 3; Nat», b: «3, 4; Nat», return: Cn [«8; Nat», «8; Nat»]) =
+    let (a, b) = (buf a, buf b);
+    let flat = reshape (2, 4) 8 (a * b);
+    return (unary add1 flat, unary dbl flat);
+
+extern lam _compile (): compile.Phase =
+    compile.phases ff (
+        compile.cleanup,
+        lower_tensor,
+        fuse_tensor,
+        compile.cleanup,
+    );
+
+// CHECK-COUNT-3: tensor.map_reduce
+// CHECK-NOT: tensor.map_reduce

@@ -1,0 +1,25 @@
+// RUN: %mim -p opt %s -o - | %FileCheck %s
+
+// `work`'s domain is dependent: the type of `v` names `n`.
+// Narrowing such a signature would tear the components off their binder,
+// so SEO leaves it alone - even though every argument is constant at the only call site.
+
+plugin core;
+plugin mem;
+plugin compile;
+
+use core.ops.n;
+
+extern fun test(m: mem.M 0, n: Nat, v: «n; Nat»): [mem.M 0, Nat] =
+    work (m, n, v, 7, return) where
+        con work (m: mem.M 0, n: Nat, v: «n; Nat», k: Nat, cont: Cn [mem.M 0, Nat]) =
+            cont (m, k + n);
+    end;
+
+extern lam _compile(): compile.Phase =
+    compile.phases ff (
+        compile.cleanup,
+        mem.seo,
+    );
+
+// CHECK-DAG: con work ({{[_a-z0-9]+}}: core.M 0, n: Nat, {{[_a-z0-9]+}}: «n; Nat», {{[_a-z0-9]+}}: Nat, {{[_a-z0-9]+}}: Cn [core.M 0, Nat])

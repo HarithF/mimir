@@ -1,7 +1,7 @@
 """Top-level binding registration smoke tests for mim.
 
-Catches missing init_*(m) calls in py/bindings/py.cpp and missing
-re-exports in mim/__init__.py without mirroring the full public API.
+Catches missing init_*(m) calls in the generated module entry point and
+missing re-exports in mim/__init__.py without mirroring the full public API.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def test_wrapper_symbol_present():
 def test_log_levels_exported():
     for level_name in ("Error", "Warn", "Info", "Verbose", "Debug"):
         level = getattr(mim, level_name)
-        assert isinstance(level, mim.Level)
+        assert isinstance(level, mim.LogLevel)
 
 
 def test_mim_error_is_exception():

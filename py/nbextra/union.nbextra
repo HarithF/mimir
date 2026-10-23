@@ -1,0 +1,7 @@
+[standalone]
+    // Bot/Top are the concrete instantiations of the TExt class template, which
+    // the generator cannot bind directly. Register them explicitly (after their
+    // Ext base above) so every Def subclass is reachable from Python. They are
+    // Defs, so — like Def — never_destruct.
+    nb::class_<Bot, Ext>(m, "Bot", nb::never_destruct());
+    nb::class_<Top, Ext>(m, "Top", nb::never_destruct());

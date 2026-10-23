@@ -1,11 +1,14 @@
 // Combining analyses, combining optimizations, Fig. 10
 // RUN: rm -rf %t && mkdir -p %t && cd %t && %mim -p opt %s -p ll && %FileCheck %s < %{s:stem}.ll
 plugin core;
+plugin mem;
 
-cfun dont_know[]: Bool;
-cfun read[]: Nat;
+use core.ops.n;
 
-fun extern foo(x: Nat): Nat =
+extern fun dont_know[]: Bool;
+extern fun read[]: Nat;
+
+extern fun foo(x: Nat): Nat =
     let x = 1;
     ret z = read $ ();
     let y = z;
@@ -14,15 +17,13 @@ fun extern foo(x: Nat): Nat =
             ret cond = dont_know $ ();
             (exit, body)#cond () where
                 con body() =
-                    let cond = %core.ncmp.ne (y, z);
-                    (f1, t1)#cond ()
+                    (f1, t1)#(y != z) ()
                     where
                         con f1() = n1 x;
                         con t1() = n1 2;
                         con n1(x: Nat) =
-                            let x    = %core.nat.sub (2, x);
-                            let cond = %core.ncmp.ne (x, 1);
-                            (f2, t2)#cond ()
+                            let x    = 2 - x;
+                            (f2, t2)#(x != 1) ()
                             where
                                 con f2() = n2 y;
                                 con t2() = n2 2;
@@ -32,18 +33,5 @@ fun extern foo(x: Nat): Nat =
                 con exit() = return x;
             end
     end;
-
-lam extern _compile(): %compile.Phase =
-    %compile.phases ff (
-        %compile.internal_cleanup,
-        %compile.phases tt (
-            %compile.phases tt (
-                %compile.beta_red,
-                %compile.eta_conv,
-            ),
-            %mem.seo,
-        ),
-        %compile.named "%ll.emit",
-    );
 
 // CHECK: ret i64 1

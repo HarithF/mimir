@@ -1,9 +1,0 @@
-// RUN: rm -f %t.ll
-// RUN: %mim -p opt %s -o - | %FileCheck %s
-
-plugin core;
-
-con extern icmp_lit(return: Cn Bool) =
-    return (%core.icmp.e (%core.icmp.uge (tt, ff), %core.icmp.ug (tt, ff)));
-
-// CHECK-DAG: return{{.*}}tt

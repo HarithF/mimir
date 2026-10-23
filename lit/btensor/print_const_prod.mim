@@ -1,0 +1,35 @@
+// RUN: rm -f %{s:stem}.ll
+// RUN: %mim -p opt -o - -p ll %s
+// RUN: clang %S/../lib.c %{s:stem}.ll -o %t -Wno-override-module
+// RUN: %t 2 3 | %FileCheck %s
+
+plugin core;
+plugin math;
+plugin btensor;
+plugin buffer;
+plugin mem;
+
+let MT1 = (2, (2, 4), math.F64);
+let MT2 = (2, (4, 3), math.F64);
+fun mul_add (m: mem.M 0, acc: math.F64, (a b: math.F64))@tt: [mem.M 0, math.F64] =
+    return (m, math.arith.add 0 (acc, math.arith.mul math.mode.none (a, b)));
+
+extern con print_int_matrix    [mm: mem.M 0, k l: Nat, m: buffer.Buf (2, (k, l), I32), return: Cn [mem.M 0]];
+extern con print_double_matrix [mm: mem.M 0, k l: Nat, m: buffer.Buf (2, (k, l), math.F64), return: Cn [mem.M 0]];
+
+
+extern con main (mm: mem.M 0, argc: I32, argv: mem.Ptr («core.idx2nat argc; mem.Ptr (mem.Char, 0)», 0), return: Cn [mem.M 0, I32]) =
+    con return_cont (mm: mem.M 0) = return (mm, 0I32);
+    let c         = 3.0:math.F64;
+    let d         = 5.0:math.F64;
+    let (mm, m1)  = buffer.lit MT1 (mm, c);
+    let (mm, m2)  = buffer.lit MT2 (mm, d);
+    let (mm, dst) = buffer.alloc (2, (2, 3), math.F64) mm;
+    let (mm, mP)  = btensor.map_reduce ((2, 3), (2, 3, 4)) (mul_add, 0.0:math.F64)
+        (btensor.proj_map (0, 1))
+        (btensor.proj_map (0, 2), btensor.proj_map (2, 1))
+        (mm, dst, (m1, m2));
+    print_double_matrix (mm, 2, 3, mP, return_cont);
+
+// CHECK: 60.00, 60.00, 60.00,
+// CHECK: 60.00, 60.00, 60.00,

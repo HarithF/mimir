@@ -7,87 +7,147 @@
 /// ## Dependencies
 ///
 import compile;
+plugin core;
 ///
 /// ## Types
 ///
-/// ### %%mem.M {#memM}
+/// ### M {#memM}
 ///
-/// This type tracks all kinds of side effects in the given address space.
-axm %mem.M: Nat → *;
+/// The effect token core.M.
+anx M = core.M;
 ///
-/// ### %%mem.Ptr
+/// ### Ptr
 ///
-/// Pointer type with *pointee* type `T` and *address space* `a`.
-/// At the moment, the *address space* is not really used and serves as a placeholder for future work.
-axm %mem.Ptr: [*, Nat] → *;
+/// The pointer type core.Ptr.
+anx Ptr = core.Ptr;
 
-lam %mem.Ptr0(T: *): * = %mem.Ptr (T, 0);
+anx lam Ptr0 (T: *): * = Ptr (T, 0);
+///
+/// ### Char & Str
+///
+/// A character and a pointer to a string of `n` of them.
+anx let Char = I8;
+anx lam Str (n: Nat): * = Ptr0 «n; Char»;
 ///
 /// ## Operations w/ Side Effects
 ///
 /// The following operations have side effects.
-/// For this reason, they consume a `%%mem.M a` and yield a new `%%mem.M a`.
+/// For this reason, they consume a `mem.M a` and yield a new `mem.M a`.
 ///
-/// ### %%mem.load
+/// ### load
 ///
-/// Loads the pointee of type `T` from a pointer of type `%%mem.Ptr (T, a)`.
-axm %mem.load: {T: *, a: Nat} as Ta → [%mem.M a, %mem.Ptr Ta] → [%mem.M a, T], normalize_load;
+/// Loads the pointee of type `T` from a pointer of type `mem.Ptr (T, a)`.
+axm load: {T: *, a: Nat} as Ta → [M a, Ptr Ta] → [M a, T], normalize_load;
 ///
-/// ### %%mem.store
+/// ### store
 ///
-/// Stores a value of type `T` to the location pointed to by a pointer of type `%%mem.Ptr (T, a)`.
-axm %mem.store: {T: *, a: Nat} as Ta → [%mem.M a, %mem.Ptr Ta, T] → %mem.M a, normalize_store;
+/// Stores a value of type `T` to the location pointed to by a pointer of type `mem.Ptr (T, a)`.
+axm store: {T: *, a: Nat} as Ta → [M a, Ptr Ta, T] → M a, normalize_store;
 ///
-/// ### %%mem.remem
+/// ### fresh
 ///
-/// Creates a new dummy `%%mem.M a`-typed value in order to acknowledge the fact that some unspecified side-effect happened.
-axm %mem.remem: {a: Nat} → %mem.M a → %mem.M a, normalize_remem;
+/// Passes a *fresh* `mem.M a` for address space `a` to its return continuation: `ret mem = mem.fresh $ 0`.
+/// Conversion-only phases (e.g. `tensor.lower_to_mem`) emit memory operations before memory has been threaded.
+/// Each call site's return continuation is a distinct mutable, so the received memories are distinct by construction -
+/// hash-consing cannot collapse two otherwise identical memory operations into one.
+/// `mem.add_mem` resolves each call by jumping to the continuation with the memory that is current at that point.
+axm fresh: Fn [a: Nat] → M a;
 ///
-/// ### %%mem.alloc
+/// ### alloc
 ///
 /// Allocates memory of type `T` in address space `a`.
-axm %mem.alloc: [*, a: Nat] as Ta → [%mem.M a] → [%mem.M a, %mem.Ptr Ta];
+axm alloc: [*, a: Nat] as Ta → [M a] → [M a, Ptr Ta];
 ///
-/// ### %%mem.slot
+/// ### slot
 ///
 /// Reserves a stack slot for type `T` in address space `a`.
 /// The slot is passed to the continuation and its lifetime is scoped to that continuation.
-axm %mem.slot: [*, a: Nat] as Ta → Fn %mem.M a → [%mem.M a, %mem.Ptr Ta];
+axm slot: [*, a: Nat] as Ta → Fn M a → [M a, Ptr Ta];
 ///
-/// ### %%mem.malloc
+/// ### malloc
 ///
 /// Allocates memory of type `T` in address space `a`.
-/// The difference to `%%mem.alloc` is that the size is passed explicitly (in bytes) instead of being derived from `T`.
-axm %mem.malloc: [*, a: Nat] as Ta → [%mem.M a, Nat] → [%mem.M a, %mem.Ptr Ta];
+/// The difference to `mem.alloc` is that the size is passed explicitly (in bytes) instead of being derived from `T`.
+axm malloc: [*, a: Nat] as Ta → [M a, Nat] → [M a, Ptr Ta];
 ///
-/// ### %%mem.free
+/// ### free
 ///
 /// Frees memory of type `T` in address space `a`.
-axm %mem.free: {*, a: Nat} as Ta → [%mem.M a, %mem.Ptr Ta] → %mem.M a;
+axm free: {*, a: Nat} as Ta → [M a, Ptr Ta] → M a;
 ///
-/// ### %%mem.mslot
+/// ### mslot
 ///
 /// Reserves a stack slot for type `T` in address space `a`.
 /// The reserved slot will be `size` bytes large.
 /// The slot is passed to the continuation and its lifetime is scoped to that continuation.
-axm %mem.mslot: [*, a: Nat] as Ta → Fn [%mem.M a, size: Nat] → [%mem.M a, %mem.Ptr Ta];
+axm mslot: [*, a: Nat] as Ta → Fn [M a, size: Nat] → [M a, Ptr Ta];
 ///
 /// ## Operations w/o Side Effects
 ///
-/// ### %%mem.lea
+/// ### lea
 ///
 /// Load effective address.
 /// Performs address computation by offsetting the passed pointer with index `i`.
-axm %mem.lea: {n: Nat, Ts: «n; *», a: Nat} → [%mem.Ptr («j: n; Ts#j», a), i: Idx n] → %mem.Ptr (Ts#i, a), normalize_lea;
+axm lea: {n: Nat, Ts: «n; *», a: Nat} → [Ptr («j: n; Ts#j», a), i: Idx n] → Ptr (Ts#i, a), normalize_lea;
+///
+/// ### decay
+///
+/// Pointer to the first element of an array, akin to C's array-to-pointer decay.
+anx lam decay {n: Nat, T: *, a: Nat} (p: Ptr («n; T», a)): Ptr (T, a) = lea (p, 0:(Idx n));
+///
+/// ### assume
+///
+/// Views `p` as a pointer to an array of `n` elements.
+/// @warning This is *unchecked*: the caller vouches for the length, e.g. for memory a C function hands over.
+axm assume: {T: *, a: Nat} as Ta → [Ptr Ta, n: Nat] → Ptr («n; T», a);
+///
+/// ### cstr
+///
+/// Views a NUL-terminated C string `p` as an array of its `n` characters, excluding the NUL.
+/// @warning This is *unchecked*: `p` must actually point to a NUL-terminated string.
+///
+anx fun cstr (m: M 0, p: Ptr0 Char): [M 0, n: Nat, Str n] =
+    loop (m, 0)
+    where
+        con loop (m: M 0, i: Nat) =
+            let n      = core.nat.add (i, 1);
+            let (m, c) = load (m, lea (assume (p, n), core.idx 0 n i));
+            (next, done)#(core.icmp.e (c, 0I8)) m
+            where
+                con next (m: M 0) = loop (m, n);
+                con done (m: M 0) = return (m, i, assume (p, i));
+            end
+    end;
 ///
 /// ## Phases
 ///
-/// * `add_mem`: threads `%%mem.M` through functions that lack it.
-/// * `seo`: Symbolic Expression Optimization - SSA construction, expression propagation, and GVN in one fixed point (see mim::plug::mem::phase::SEO).
-/// * `remem_repl`: removes `%%mem.remem`s.
-/// * `alloc2malloc_repl`: rewrites `%%mem.alloc` / `%%mem.slot` into `%%mem.malloc` / `%%mem.mslot`.
+/// ### add_mem
 ///
-axm %mem.add_mem:           %compile.Phase;
-axm %mem.seo:               %compile.Phase;
-axm %mem.remem_repl:        %compile.Phase;
-axm %mem.alloc2malloc_repl: %compile.Phase;
+/// Threads `mem.M` through functions that lack it.
+///
+axm add_mem: compile.Phase;
+///
+/// ### free_locals
+///
+/// Frees the memory a function allocates but does not let escape (see mim::plug::mem::EscapeAnalysis).
+///
+axm free_locals: compile.Phase;
+///
+/// ### heap2stack
+///
+/// Turns a small `mem.alloc` that does not escape its function into a `mem.slot` (see mim::plug::mem::phase::Heap2Stack).
+/// `-X mem:heap2stack=<n>` sets the maximum number of elements to stack-allocate; `0` disables it.
+///
+axm heap2stack: compile.Phase;
+///
+/// ### seo
+///
+/// Symbolic Expression Optimization — SSA construction, expression propagation, and GVN in one fixed point (see mim::plug::mem::phase::SEO).
+///
+axm seo: compile.Phase;
+///
+/// ### alloc2malloc_repl
+///
+/// Rewrites `mem.alloc` / `mem.slot` into `mem.malloc` / `mem.mslot`.
+///
+axm alloc2malloc_repl: compile.Phase;

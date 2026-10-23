@@ -1,0 +1,27 @@
+// RUN: %mim -p opt %s -o - | %FileCheck %s --implicit-check-not=eta_
+plugin core;
+plugin mem;
+
+use core.ops.n;
+
+extern fun foo [Nat]: Nat;
+
+// The canonical example of Fluet & Weeks, "Contification Using Dominators", §1:
+//     fun g y = y - 1
+//     fun f b = (if b then g 13 else g 15) + 1
+// with `1` replaced by `f`'s `n`, so `g` captures it and genuinely has to live inside `f`.
+// Both call sites of `g` return to `k`, so SCCP propagates it and the continuation parameter vanishes.
+// Where `g` sits falls out of its free vars, so nothing has to compute a placement for it.
+extern fun f (b: Bool, n: Nat): Nat =
+    (l2, l1)#b () where
+        con l1 () = g (13, k);
+        con l2 () = g (15, k);
+        fun g (y: Nat): Nat =
+            ret res = foo $ y;
+            return (y - n - res);
+        con k (x: Nat) = return (x + 1);
+    end;
+
+// CHECK: con g (y: Nat) =
+// CHECK-DAG: g 15;
+// CHECK-DAG: g 13;

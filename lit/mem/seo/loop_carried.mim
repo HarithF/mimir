@@ -12,41 +12,30 @@
 plugin core;
 plugin mem;
 
-cfun dont_know[mem: %mem.M 0]: [%mem.M 0, Bool];
+use core.ops.n;
 
-fun extern test(mem: %mem.M 0): [%mem.M 0, Nat] =
-    ret (mem, p) = %mem.slot (Nat, 0) $ mem;
-    let mem      = %mem.store (mem, p, 42);
+extern fun dont_know[m: mem.M 0]: [mem.M 0, Bool];
 
-    head (mem, p) where
-        con head(mem: %mem.M 0, p: %mem.Ptr0 Nat) =
-            ret (mem, cond) = dont_know $ mem;
+extern fun test(m: mem.M 0): [mem.M 0, Nat] =
+    ret (m, p) = mem.slot (Nat, 0) $ m;
+    let m      = mem.store (m, p, 42);
 
-            (exit, body)#cond mem where
+    head (m, p) where
+        con head(m: mem.M 0, p: mem.Ptr0 Nat) =
+            ret (m, cond) = dont_know $ m;
 
-                con body(mem: %mem.M 0) =
-                    let (mem, x) = %mem.load (mem, p);
-                    let x1       = %core.nat.add (x, 1);
-                    let mem      = %mem.store (mem, p, x1);
-                    head (mem, p);
+            (exit, body)#cond m where
 
-                con exit(mem: %mem.M 0) =
-                    let (mem, x) = %mem.load (mem, p);
-                    return (mem, x);
+                con body(m: mem.M 0) =
+                    let (m, x) = mem.load (m, p);
+                    let m      = mem.store (m, p, x + 1);
+                    head (m, p);
+
+                con exit(m: mem.M 0) =
+                    let (m, x) = mem.load (m, p);
+                    return (m, x);
             end
     end;
-
-lam extern _compile(): %compile.Phase =
-    %compile.phases ff (
-        %compile.internal_cleanup,
-        %compile.phases tt (
-            %compile.beta_red,
-            %compile.eta_conv,
-        ),
-        %mem.seo,
-        %compile.named "%mem.alloc2malloc_repl",
-        %compile.named "%ll.emit",
-    );
 
 // The slot is promoted (no alloca) and the loop-carried return value is threaded through the header phi,
 // never frozen to the entry constant 42.

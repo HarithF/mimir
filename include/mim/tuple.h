@@ -1,5 +1,8 @@
 #pragma once
 
+#include <concepts>
+
+#include <algorithm>
 #include <span>
 
 #include "mim/def.h"
@@ -12,7 +15,21 @@ protected:
     using Def::Def;
 
 public:
-    ~Prod() override;
+    /// Prod groups Sigma and Tuple; see fe::NodeSetable.
+    static constexpr bool isa_node(mim::Node n) noexcept { return n == mim::Node::Sigma || n == mim::Node::Tuple; }
+
+    /// @name Concatenation
+    /// Splices @p a as @p n and @p b as @p m components into one flat Prod.
+    /// @note @p n / @p m are *not* necessarily Def::arity: `n == 1` leaves @p a a single component,
+    /// which is exactly what `tuple.append` / `tuple.prepend` instantiate `tuple.cat` with.
+    ///@{
+    static const Def* cat(bool term, nat_t n, nat_t m, const Def* a, const Def* b);
+    /// Splices @p a and @p b *completely*, with @p n / @p m from Def::arity.
+    /// @returns `nullptr`, if they are not statically known.
+    static const Def* cat(bool term, const Def* a, const Def* b);
+    /// The spliced components themselves - for when you want to build something other than a Prod from them.
+    static DefVec cat_projs(nat_t n, nat_t m, const Def* a, const Def* b);
+    ///@}
 
     static constexpr size_t Num_Ops = std::dynamic_extent;
 };
@@ -38,30 +55,27 @@ public:
 
     /// @name Rebuild
     ///@{
-    const Def* immutabilize() final;
-    Sigma* stub(const Def* type) { return stub_(world(), type)->set(dbg()); }
-
     /// @note Technically, it would make sense to have an offset of 1 as the first element can't be reduced.
     /// For example, in `[n: Nat, F n]` `n` only occurs free in the second element.
     /// However, this would cause a lot of confusion and special code to cope with the first element,
     /// So we just keep it.
-    constexpr size_t reduction_offset() const noexcept final { return 0; }
     ///@}
 
     /// @name Type Checking
     ///@{
-    const Def* check(size_t, const Def*) final;
-    const Def* check() final;
     static const Def* infer(World&, Defs);
-    const Def* arity() const final;
+    ///@}
+
+    /// @name Concatenation
+    /// @see Prod::cat
+    ///@{
+    static const Def* cat(nat_t n, nat_t m, const Def* a, const Def* b) { return Prod::cat(false, n, m, a, b); }
+    static const Def* cat(const Def* a, const Def* b) { return Prod::cat(false, a, b); }
     ///@}
 
     static constexpr auto Node = mim::Node::Sigma;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-    Sigma* stub_(World&, const Def*) final;
-
     friend class World;
 };
 
@@ -71,15 +85,182 @@ class Tuple : public Prod, public Setters<Tuple> {
 public:
     using Setters<Tuple>::set;
     static const Def* infer(World&, Defs);
+
+    /// @name Concatenation
+    /// @see Prod::cat
+    ///@{
+    static const Def* cat(nat_t n, nat_t m, const Def* a, const Def* b) { return Prod::cat(true, n, m, a, b); }
+    static const Def* cat(const Def* a, const Def* b) { return Prod::cat(true, a, b); }
+    ///@}
+
     static constexpr auto Node = mim::Node::Tuple;
 
 private:
     Tuple(const Def* type, Defs args)
         : Prod(Node, type, args, 0) {}
 
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-
     friend class World;
+};
+
+/// Filters the components of an aggregate and keeps track of where the survivors end up.
+/// This is what a Phase needs that *drops* components of a Sigma - or the parameters of a Lam:
+/// * Sieve::gather rebuilds an immutable aggregate,
+/// * Sieve::new2old rebuilds a mutable one via Rewriter::rewrite_stub, and
+/// * Sieve::operator[] adjusts the index of every Extract / Insert into it.
+///
+/// @note Only a Sigma ever needs that last adjustment: an Arr's components all share one type - so it is dropped as a
+/// whole - and World::extract_fused splits a fused index at the Arr boundary, which leaves a Sigma's index scalar.
+///
+/// A rewrite that also *adds* components - `mem::SEO` threads fresh φs through a Lam - Sieve::cat%s them as further
+/// candidates: they extend the very same index space, so one Sieve still answers the whole new layout.
+class Sieve {
+public:
+    static constexpr size_t Gone = size_t(-1); ///< @see Sieve::operator[]
+
+    /// @name Construction
+    ///@{
+    /// Keeps all @p num components.
+    explicit Sieve(size_t num)
+        : num_(num)
+        , new2old_(num, [](size_t i) { return i; }) {}
+
+    /// Keeps those of @p num candidates that satisfy @p pred.
+    Sieve(size_t num, std::predicate<size_t> auto pred)
+        : num_(num) {
+        new2old_.reserve(num);
+        for (size_t i = 0; i != num; ++i)
+            if (pred(i)) new2old_.emplace_back(i);
+    }
+
+    /// Keeps those @p ops that satisfy @p pred.
+    Sieve(Defs ops, std::predicate<const Def*> auto pred)
+        : Sieve(ops.size(), [ops, pred](size_t i) { return pred(ops[i]); }) {}
+    ///@}
+
+    /// @name Concat
+    /// Candidates the rewrite *adds*; they have no old counterpart and simply continue the candidate indices.
+    ///@{
+    /// Concats @p num candidates behind the old ones and keeps those that satisfy @p pred.
+    /// @note A concat'ed component has no old op to rewrite from, so this rules out Sieve::new2old.
+    void cat(size_t num, std::predicate<size_t> auto pred) {
+        new2old_.reserve(new2old_.size() + num);
+        for (size_t i = 0; i != num; ++i)
+            if (pred(i)) {
+                new2old_.emplace_back(num_ + i);
+                ++num_cat_new_;
+            }
+        num_ += num;
+        num_cat_ += num;
+    }
+
+    size_t num_cat() const { return num_cat_; }                   ///< Number of concat'ed candidates.
+    size_t cat(size_t i) const { return (*this)[num_old() + i]; } ///< As Sieve::operator[] but for concat'ed @p i.
+    ///@}
+
+    /// @name Getters
+    ///@{
+    size_t num_old() const { return num_ - num_cat_; } ///< Number of old components.
+    size_t num_new() const { return new2old_.size(); } ///< Number of survivors.
+    /// Is the new aggregate the old one - nothing dropped and nothing concat'ed?
+    bool all() const { return num_new() == num_old() && num_cat_new_ == 0; }
+    /// The old index of the @p i th survivor; this is what Rewriter::rewrite_stub expects.
+    fe::View<size_t> new2old() const {
+        assert(num_cat_ == 0 && "rewrite_stub cannot rewrite a concat'ed component from an old op");
+        return new2old_;
+    }
+    /// The new index of the candidate @p i - or Sieve::Gone, if it didn't survive.
+    size_t operator[](size_t i) const {
+        auto j = std::ranges::lower_bound(new2old_, i);
+        return j != new2old_.end() && *j == i ? size_t(j - new2old_.begin()) : Gone;
+    }
+    /// The surviving components of @p ops - one per candidate, concat'ed ones included.
+    DefVec gather(Defs ops) const {
+        assert(ops.size() == num_);
+        return DefVec(num_new(), [this, ops](size_t i) { return ops[new2old_[i]]; });
+    }
+    ///@}
+
+private:
+    size_t num_; ///< Candidates - old ones followed by concat'ed ones.
+    size_t num_cat_     = 0;
+    size_t num_cat_new_ = 0; ///< Survivors among the concat'ed candidates.
+    fe::Vector<size_t> new2old_;
+};
+
+/// The extents of a Seq's axes: a plain `Nat` for a single axis, an aggregate of them for several.
+/// A multi-dimensional *index* into a Seq has the very same structure - one component per axis, `Idx` instead of
+/// `Nat` - so it uses this view as well.
+/// @note A Shape is a non-owning view over a Def and may be null; Shape::operator* hands the Def back.
+class Shape {
+public:
+    constexpr Shape() noexcept = default;
+    constexpr Shape(const Def* def) noexcept
+        : def_(def) {}
+    Shape(World&, Defs shape);
+
+    /// @name Getters
+    ///@{
+    constexpr const Def* operator*() const noexcept { return def_; }
+    constexpr const Def* operator->() const noexcept { return def_; }
+    constexpr explicit operator bool() const noexcept { return def_ != nullptr; }
+    ///@}
+
+    /// @name Axes
+    ///@{
+    bool is_dim() const; ///< Is this a *single* axis - a `Nat`/`Idx` rather than an aggregate of them?
+    bool is_fused() const { return !is_dim(); } ///< Does this span several axes? Also `true` for a dynamic rank.
+    std::optional<nat_t> rank() const;          ///< Number of axes; `std::nullopt` if not statically known.
+    /// The @p i th axis.
+    /// @note Needs Shape::rank: Def::num_projs would silently read a dynamic rank as `1` and hand back the Shape.
+    const Def* operator[](nat_t i) const {
+        auto r = rank();
+        assert(r && "a dynamic rank has no statically indexable axes");
+        return def_->proj(*r, i);
+    }
+    /// The outermost axis - the Def::arity of the Seq this shape describes; null for a null Shape.
+    const Def* front() const;
+    /// The extent of @p axis: the axis itself for a shape, its `Idx` size for an index.
+    static std::optional<nat_t> extent(const Def* axis);
+    ///@}
+
+    /// @name Type Checking
+    ///@{
+    static bool isa_extents(const Def*); ///< Is @p type `Nat` - or an aggregate of `Nat`s, i.e. a shape?
+    static bool isa_indices(const Def*); ///< Is @p type `Idx` - or an aggregate of `Idx`%s, i.e. a fused index?
+    ///@}
+
+    /// @name Transform
+    /// Each of these needs Shape::rank and yields a null Shape without it.
+    ///@{
+    Shape slice(nat_t begin, nat_t end) const;        ///< The axes `[begin, end)`.
+    Shape take(nat_t n) const { return slice(0, n); } ///< The leading @p n axes.
+    Shape drop(nat_t n) const;                        ///< All but the leading @p n axes.
+    Shape operator+(Shape) const;                     ///< Concatenation - what fuses `«a; «b; T»»` into `«a, b; T»`.
+    Shape zonk() const { return {def_->zonk()}; }     ///< Wraps Def::zonk();
+
+    /// This Shape with only the axes @p keep accepts; `*this`, if it accepts all of them or the rank is dynamic.
+    Shape filter(auto keep) const {
+        if (auto r = rank()) {
+            auto kept = DefVec();
+            kept.reserve(*r);
+            for (nat_t i = 0; i != *r; ++i)
+                if (auto a = def_->proj(*r, i); keep(i, a)) kept.emplace_back(a);
+
+            return kept.size() == *r ? *this : Shape(def_->world(), kept);
+        }
+        return *this;
+    }
+
+    /// Drops every literal size-1 axis, mirroring `«1; T»` ≡ `T`; all of them folded away leaves rank `0`.
+    Shape fold() const;
+
+    /// As above but driven by @p shape: drops the axes *it* has as literal `1`, whatever this one's own extents
+    /// are - a broadcast reads a size-1 input axis at the *output*'s loop index.
+    Shape fold(Shape shape) const;
+    ///@}
+
+private:
+    const Def* def_ = nullptr;
 };
 
 /// Base class for Arr and Pack.
@@ -88,11 +269,18 @@ protected:
     using Def::Def;
 
 public:
-    ~Seq() override;
+    /// Seq groups Arr and Pack; see fe::NodeSetable.
+    static constexpr bool isa_node(mim::Node n) noexcept { return n == mim::Node::Arr || n == mim::Node::Pack; }
 
     /// @name ops
     ///@{
-    const Def* body() const { return ops().back(); }
+    /// The extents of all axes this Seq fuses.
+    /// Def::arity is the *first* of them; `«2, 3; T»` still projects into two `«3; T»`.
+    Shape shape() const { return op(0); }
+    const Def* body() const { return op(1); }
+
+    /// The element one axis down: Seq::body for a one-dimensional Seq, the Seq of the remaining axes otherwise.
+    const Def* elem() const;
     ///@}
 
     /// @name Setters
@@ -101,17 +289,13 @@ public:
     using Setters<Seq>::set;
 
     /// Common setter for Pack%s and Arr%ays.
-    /// @p arity will be ignored, if it's a Pack.
-    Seq* set(const Def* arity, const Def* body) {
-        return (node() == Node::Arr ? Def::set({arity, body}) : Def::set({body}))->as<Seq>();
-    }
+    Seq* set(const Def* shape, const Def* body) { return Def::set({shape, body})->as<Seq>(); }
     Seq* unset() { return Def::unset()->as<Seq>(); }
     ///@}
 
     /// @name Rebuild
     ///@{
-    Seq* stub(World& w, const Def* type) { return Def::stub(w, type)->as<Seq>(); }
-    virtual const Def* reduce(const Def* arg) const = 0;
+    const Def* reduce(const Def* arg) const { return Def::reduce(arg).front(); }
     ///@}
 };
 
@@ -126,42 +310,20 @@ private:
         : Seq(Node, type, 2, 0) {} ///< Constructor for a *mutable* Arr.
 
 public:
-    /// @name ops
-    ///@{
-    const Def* arity() const final { return op(0); }
-    ///@}
-
     /// @name Setters
     /// @see @ref set_ops "Setting Ops"
     ///@{
     using Setters<Arr>::set;
-    Arr* set_arity(const Def* arity) { return Def::set(0, arity)->as<Arr>(); }
+    Arr* set_shape(const Def* shape) { return Def::set(0, shape)->as<Arr>(); }
     Arr* set_body(const Def* body) { return Def::set(1, body)->as<Arr>(); }
-    Arr* set(const Def* arity, const Def* body) { return set_arity(arity)->set_body(body); }
+    Arr* set(const Def* shape, const Def* body) { return set_shape(shape)->set_body(body); }
     Arr* unset() { return Def::unset()->as<Arr>(); }
-    ///@}
-
-    /// @name Rebuild
-    ///@{
-    Arr* stub(const Def* type) { return stub_(world(), type)->set(dbg()); }
-    const Def* immutabilize() final;
-    const Def* reduce(const Def* arg) const final { return Def::reduce(arg).front(); }
-    constexpr size_t reduction_offset() const noexcept final { return 1; }
-    ///@}
-
-    /// @name Type Checking
-    ///@{
-    const Def* check(size_t, const Def*) final;
-    const Def* check() final;
     ///@}
 
     static constexpr auto Node      = mim::Node::Arr;
     static constexpr size_t Num_Ops = 2;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-    Arr* stub_(World&, const Def*) final;
-
     friend class World;
 };
 
@@ -169,40 +331,28 @@ private:
 /// @see Sigma, Tuple, Arr
 class Pack : public Seq, public Setters<Pack> {
 private:
-    Pack(const Def* type, const Def* body)
-        : Seq(Node, type, {body}, 0) {} ///< Constructor for an *immutable* Pack.
+    Pack(const Def* type, const Def* shape, const Def* body)
+        : Seq(Node, type, {shape, body}, 0) {} ///< Constructor for an *immutable* Pack.
     Pack(const Def* type)
-        : Seq(Node, type, 1, 0) {} ///< Constructor for a *mutable* Pack.
+        : Seq(Node, type, 2, 0) {} ///< Constructor for a *mutable* Pack.
 
 public:
-    /// @name ops
-    ///@{
-    const Def* arity() const final;
-    ///@}
-
     /// @name Setters
     /// @see @ref set_ops "Setting Ops"
     ///@{
     using Setters<Pack>::set;
-    Pack* set(const Def* body) { return Def::set({body})->as<Pack>(); }
+    /// @note A Pack carries its own Seq::shape: its type fuses *every* axis down to a non-array element,
+    /// which is more than the Pack itself supplies whenever its body is an aggregate - `‹2; v›` for `v: «3; T»`.
+    Pack* set_shape(const Def* shape) { return Def::set(0, shape)->as<Pack>(); }
+    Pack* set_body(const Def* body) { return Def::set(1, body)->as<Pack>(); }
+    Pack* set(const Def* shape, const Def* body) { return set_shape(shape)->set_body(body); }
     Pack* unset() { return Def::unset()->as<Pack>(); }
     ///@}
 
-    /// @name Rebuild
-    ///@{
-    Pack* stub(const Def* type) { return stub_(world(), type)->set(dbg()); }
-    const Def* immutabilize() final;
-    const Def* reduce(const Def* arg) const final { return Def::reduce(arg).front(); }
-    constexpr size_t reduction_offset() const noexcept final { return 0; }
-    ///@}
-
     static constexpr auto Node      = mim::Node::Pack;
-    static constexpr size_t Num_Ops = 1;
+    static constexpr size_t Num_Ops = 2;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-    Pack* stub_(World&, const Def*) final;
-
     friend class World;
 };
 
@@ -225,8 +375,6 @@ public:
     static constexpr size_t Num_Ops = 2;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-
     friend class World;
 };
 
@@ -253,29 +401,39 @@ public:
     static constexpr size_t Num_Ops = 3;
 
 private:
-    const Def* rebuild_(World&, const Def*, Defs) const final;
-
     friend class World;
 };
 
-/// Matches `(ff, tt)#cond` - where `cond` is **not** a Lit%eral.
-/// @note If `cond` is a Lit%eral, either
-/// * `(x, y)#lit` would have been folded to `x`/`y` anyway, or
-/// * we have something like this: `pair#0_2`
-class Select {
+/// Matches a jump table `(target_0, target_1, ...)#index` where `index` is a non-Lit%eral `Idx n` and `n` the arity.
+class Switch {
 public:
-    Select(const Def*);
+    Switch(const Def*);
 
     explicit operator bool() const noexcept { return extract_; }
 
     const Extract* extract() const { return extract_; }
-    const Def* pair() const { return extract()->tuple(); }
-    const Def* cond() const { return extract()->index(); }
-    const Def* tt() const { return pair()->proj(2, 1); }
-    const Def* ff() const { return pair()->proj(2, 0); }
+    const Def* tuple() const { return extract()->tuple(); }
+    const Def* index() const { return extract()->index(); }
 
-private:
+    size_t num_targets() const { return Lit::as(tuple()->arity()); }
+    const Def* target(size_t i) const { return tuple()->proj(num_targets(), i); }
+
+protected:
     const Extract* extract_ = nullptr;
+};
+
+/// Matches `(ff, tt)#cond` - where `cond` is a Bool but **not** a Lit%eral.
+/// @note If `cond` is a Lit%eral, either
+/// * `(x, y)#lit` would have been folded to `x`/`y` anyway, or
+/// * we have something like this: `pair#0_2`
+class Select : public Switch {
+public:
+    Select(const Def*);
+
+    const Def* pair() const { return tuple(); }
+    const Def* cond() const { return index(); }
+    const Def* tt() const { return target(1); }
+    const Def* ff() const { return target(0); }
 };
 
 /// Matches `(ff, tt)#cond arg` where `cond` is **not** a Lit%eral.
@@ -294,8 +452,8 @@ private:
     const App* app_ = nullptr;
 };
 
-/// Matches a dispatch through a jump table of the form:
-/// `(target_0, target_1, ...)#index arg` where `index` is **not** a Lit%eral.
+/// Matches `(target_0, target_1, ...)#index arg`.
+/// `(target_0, target_1, ...)#index` is matched as a Switch.
 /// @note Subsumes Branch.
 /// If you want to deal with Branch separately, match Branch first:
 /// ```
@@ -305,7 +463,7 @@ private:
 ///     // now, the generic case
 /// }
 /// ```
-class Dispatch {
+class Dispatch : public Switch {
 public:
     Dispatch(const Def*);
 
@@ -315,16 +473,8 @@ public:
     const Def* callee() const;
     const Def* arg() const;
 
-    const Extract* extract() const { return extract_; }
-    const Def* tuple() const { return extract()->tuple(); }
-    const Def* index() const { return extract()->index(); }
-
-    size_t num_targets() const { return Lit::as(extract()->tuple()->arity()); }
-    const Def* target(size_t i) const { return tuple()->proj(i); }
-
 private:
-    const App* app_         = nullptr;
-    const Extract* extract_ = nullptr;
+    const App* app_ = nullptr;
 };
 
 /// @name Helpers to work with Tuples/Sigmas/Arrays/Packs
@@ -333,27 +483,6 @@ bool is_unit(const Def*);
 std::string tuple2str(const Def*);
 
 const Def* tuple_of_types(const Def* t);
-///@}
-
-/// @name Concatenation
-/// Works for Tuple%s, Pack%s, Sigma%s, and Arr%ays alike.
-///@{
-DefVec cat(Defs, Defs);
-inline DefVec cat(const Def* a, Defs bs) { return cat(Defs{a}, bs); }
-inline DefVec cat(Defs as, const Def* b) { return cat(as, Defs{b}); }
-
-DefVec cat(nat_t n, nat_t m, const Def* a, const Def* b);
-
-const Def* cat_tuple(nat_t n, nat_t m, const Def* a, const Def* b);
-const Def* cat_sigma(nat_t n, nat_t m, const Def* a, const Def* b);
-
-const Def* cat_tuple(World&, Defs, Defs);
-const Def* cat_sigma(World&, Defs, Defs);
-
-inline const Def* cat_tuple(const Def* a, Defs bs) { return cat_tuple(a->world(), Defs{a}, bs); }
-inline const Def* cat_tuple(Defs as, const Def* b) { return cat_tuple(b->world(), as, Defs{b}); }
-inline const Def* cat_sigma(const Def* a, Defs bs) { return cat_sigma(a->world(), Defs{a}, bs); }
-inline const Def* cat_sigma(Defs as, const Def* b) { return cat_sigma(b->world(), as, Defs{b}); }
 ///@}
 
 } // namespace mim

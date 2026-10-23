@@ -1,0 +1,10 @@
+// RUN: %mim %s
+
+plugin core;
+plugin refly;
+import "lib.mim";
+use lib;              // sugar for `use lib as *;`
+use lib.inner as *;
+
+let _ = refly.struc.e (core.wrap.add 0 (answer, deep), 65I32);
+let _ = refly.struc.e (deeper.deepest, 7I32);

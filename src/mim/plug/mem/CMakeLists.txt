@@ -1,8 +1,10 @@
 add_mim_plugin(mem
     SOURCES
+        escape_analysis.cpp
         mem.cpp
         normalizers.cpp
         phase/add_mem.cpp
+        phase/free_locals.cpp
+        phase/heap2stack.cpp
         phase/seo.cpp
-    INSTALL
 )

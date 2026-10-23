@@ -5,7 +5,7 @@
 [![Discord](https://img.shields.io/discord/960975142459179068?style=social&logo=discord&logoColor=black)](https://discord.gg/FPp7hdj3fQ)
 
 [![Release](https://img.shields.io/github/v/release/mimir/mimir?style=flat-square&logo=starship&color=blue&label=Release)](https://github.com/mimir/mimir/releases)
-[![Docs](https://img.shields.io/badge/Docs-master/v0.2/v0.1-blue?style=flat-square&logo=gitbook&logoColor=white)](https://mimir.github.io)
+[![Docs](https://img.shields.io/badge/Docs-master/v0.3/v0.2/v0.1-blue?style=flat-square&logo=gitbook&logoColor=white)](https://mimir.github.io)
 [![License](https://img.shields.io/github/license/mimir/mimir?style=flat-square&color=blue&logo=opensourceinitiative&logoColor=white&label=License)](https://github.com/mimir/mimir/blob/master/LICENSE.TXT)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue?style=flat-square&logo=cplusplus)](https://en.wikipedia.org/wiki/C%2B%2B#Standardization)
 [![Python](https://img.shields.io/badge/Python-3.10-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
@@ -14,6 +14,8 @@
 [![Linux](https://img.shields.io/github/actions/workflow/status/mimir/mimir/linux.yml?style=flat-square&logo=linux&label=Linux&logoColor=white&branch=master)](https://github.com/mimir/mimir/actions/workflows/linux.yml?query=branch%3Amaster)
 [![macOS](https://img.shields.io/github/actions/workflow/status/mimir/mimir/macos.yml?style=flat-square&logo=apple&label=macOS&branch=master)](https://github.com/mimir/mimir/actions/workflows/macos.yml?query=branch%3Amaster)
 [![Windows](https://img.shields.io/github/actions/workflow/status/mimir/mimir/windows.yml?style=flat-square&label=⊞%20Windows&branch=master)](https://github.com/mimir/mimir/actions/workflows/windows.yml?query=branch%3Amaster)
+
+<div class="big-button"><a href="https://mimir.github.io/playground/">▶ Try MimIR in your Browser</a></div>
 
 [TOC]
 
@@ -31,30 +33,42 @@ MimIR brings two worlds together: typed functional IRs supply the abstractions �
 It has both at once, by extending sea-of-nodes to the Calculus of Constructions.
 And it pays off in practice: the [regex](@ref regex) plugin is the fastest engine in our evaluation (see the [POPL'25 paper](https://doi.org/10.1145/3704840)).
 
+@note 🆕 **New here?**
+- 🧭 Read the [**Tour of MimIR**](@ref mimir) — it walks through Mim's syntax and MimIR's plugin architecture.
+- 🎓 Take the [**Tutorial**](@ref tutorial) — every Mim construct in one annotated file, runnable in the [playground](https://mimir.github.io/playground/).
+- 📚 Then, read the rest of the [documentation](https://mimir.github.io/usergroup0.html).
+
 ## ✨ A Taste of Mim
 
-The following function `sq` squares `x` — for **any** type `T`, as long as `T` comes packaged with its own multiplication.
+The following function `sq` squares `x` for **any** type `T`, as long as you hand it a multiplication on `T`.
 Then, `f` instantiates `sq` for `Nat`:
 
 \include "sq.mim"
 
-That first argument `(T: *, mul: [T, T] → T)` is a [**dependent pair**](https://en.wikipedia.org/wiki/Dependent_type#%CE%A3_type) — an [existential](https://en.wikipedia.org/wiki/Type_system#Existential_types) bundling a type together with an operation on it.
-In MimIR, types are ordinary [**first-class values**](https://en.wikipedia.org/wiki/First-class_citizen): `T` and `mul` are just arguments, so polymorphism, [type operators](https://en.wikipedia.org/wiki/Type_constructor), and dependent types all fall out of the same mechanism.
+@note ▶ Every Mim snippet in these docs comes with a run button that opens it in the [playground](https://mimir.github.io/playground/): hit it to play around with the code right away.
 
-And under the hood, MimIR is not a list of instructions but a **graph** — and that graph *is* the program.
+The type `T` sits in `{}` and is therefore an **implicit** argument: `f` just writes `sq nat.mul`, and MimIR infers `T = Nat` from the type of `nat.mul`.
+The remaining parameter is named `` `* `` — the [infix operator](@ref infix) `*` escaped into an ordinary identifier — so the body's `x * x` is nothing but an application of that very parameter.
+Its type `[T, T] → T` mentions `T`, which makes `sq` a [**dependent function**](https://en.wikipedia.org/wiki/Dependent_type#%CE%A0_type).
+In MimIR, types are ordinary [**first-class values**](https://en.wikipedia.org/wiki/First-class_citizen): `T` and `` `* `` are just arguments, so polymorphism, [type operators](https://en.wikipedia.org/wiki/Type_constructor), and dependent types all fall out of the same mechanism.
+(`plugin core as *` splices `core`'s annexes into the top-level scope, which is why `nat.mul` needs no `core.` prefix.)
+
+And under the hood, MimIR is not a list of instructions but a **graph** — and that graph _is_ the program.
 The graph is also **complete**: it holds everything needed to make sense of the program, with no auxiliary side structure.
 Contrast a traditional instruction list, which is meaningless on its own and only becomes intelligible once you pair it with a separately maintained [control-flow graph](https://en.wikipedia.org/wiki/Control-flow_graph).
 
 Watch what happens to `sq`.
-When `f` applies `sq (Nat, %core.nat.mul)`, that application is [β-reduced](https://en.wikipedia.org/wiki/Lambda_calculus) **on the fly, during graph construction** — not in any later pass.
+When `f` applies `sq nat.mul`, that application is [β-reduced](https://en.wikipedia.org/wiki/Lambda_calculus) **on the fly, during graph construction** — not in any later pass.
 This is permitted because `sq` carries the default `tt` [`filter`](@ref mim::Lam::filter) that every direct-style function gets, which greenlights inlining.
-What remains is the bare `x * x`, with **no trace** of `sq` or the existential abstraction.
-The original `sq` lambda is now simply unreachable from the world's [roots](@ref mim::World::roots) (`sq` is not `extern`), so traversing the graph never reaches it; a [`Cleanup`](@ref mim::Cleanup) phase later drops it for good:
+What remains is the bare `x * x`, with **no trace** of `sq` or its abstraction over `T` and `` `* ``.
+The original `sq` lambda is now simply unreachable from the world's [roots](@ref mim::World::externals) (`sq` is not `extern`), so traversing the graph never reaches it; a [`Cleanup`](@ref mim::Cleanup) phase later drops it for good:
 
 @image html sq.svg "The MimIR graph of `f` — the abstraction has evaporated (type edges elided)"
+@image html sq-dark.svg "The MimIR graph of `f` — the abstraction has evaporated (type edges elided)"
 
 For the full picture, with more examples and the graphs MimIR builds for them, read the [Tour of MimIR](@ref mimir).
 With MimIR's Python bindings, you can write full-blown DSL compilers embedded in Python; see the [embedded Python DSL](@ref python) for a complete end-to-end example.
+Or, naturally, you can continue exploring the rest of the [documentation](https://mimir.github.io/usergroup0.html).
 
 ## 💡 Why MimIR?
 
@@ -89,7 +103,6 @@ cmake --build build -j$(nproc) --target install
 ```
 
 See the full [build options](@ref building) in the [Contributing & Debugging](@ref coding) guide.
-New here? Start with the [Tour of MimIR](@ref mimir).
 
 ## 🔥 Key Innovations
 
@@ -100,7 +113,7 @@ For example, the [`demo`](@ref demo) plugin declares one axiom and wires it to a
 
 ```mim
 /// the 42 constant, folded by the `normalize_const` C++ normalizer
-axm %demo.const_idx: [n: Nat] → Idx n, normalize_const;
+axm demo.const_idx: [n: Nat] → Idx n, normalize_const;
 ```
 
 The matching shared library implements `normalize_const` and any lowering or [phases](@ref phases); C++ does the heavy lifting of optimization, lowering, and code generation.
@@ -187,14 +200,16 @@ MimIR is licensed under the [MIT License](https://github.com/mimir/mimir/blob/ma
   [![PDF](https://img.shields.io/badge/PDF-grey?style=flat-square&logo=readthedocs)](https://raw.githubusercontent.com/leissa/leissa/main/pdf/lg26.pdf)
   [![ACM](https://img.shields.io/badge/ACM-10.1145/3808286-blue?style=flat-square&logo=acm)](https://doi.org/10.1145/3808286)
   [![arXiv](https://img.shields.io/badge/arXiv-10.48550/arXiv.2604.09961-blue?style=flat-square&logo=arxiv)](https://doi.org/10.48550/arXiv.2604.09961)
-  [![zenodo](https://img.shields.io/badge/-10.5281%2Fzenodo.19069678-blue?style=flat-square&logo=zenodo&logoColor=white&labelColor=555&logoSize=auto)](https://doi.org/10.5281/zenodo.19069678)
+  [![zenodo](https://img.shields.io/badge/-10.5281/zenodo.19069678-blue?style=flat-square&logo=zenodo&logoColor=white&labelColor=555&logoSize=auto)](https://doi.org/10.5281/zenodo.19069678)
+  [![YouTube](https://img.shields.io/badge/YouTube-grey?style=flat-square&logo=youtube)](https://www.youtube.com/watch?v=Xo5N0SGkuHg)
+  [![dblp](https://img.shields.io/badge/dblp-grey?style=flat-square&logo=dblp)](https://dblp.uni-trier.de/rec/journals/pacmpl/LeissaG26.html?view=bibtex)
   <br><br>
 
 - **MimIrADe: Automatic Differentiation in MimIR** <br>
   Marcel Ullrich, Sebastian Hack, Roland Leißa <br>
   [![CC 2025](https://img.shields.io/badge/CC-2025-blue?style=flat-square)](https://conf.researchr.org/home/CC-2025)
   [![PDF](https://img.shields.io/badge/PDF-grey?style=flat-square&logo=readthedocs)](https://raw.githubusercontent.com/leissa/leissa/main/pdf/uhl25.pdf)
-  [![ACM](https://img.shields.io/badge/ACM-10.1145/3708493.3712685-blue?style=flat-square&logo=acm)](https://dl.acm.org/doi/abs/10.1145/3708493.3712685)
+  [![ACM](https://img.shields.io/badge/ACM-10.1145/3708493.3712685-blue?style=flat-square&logo=acm)](https://doi.org/10.1145/3708493.3712685)
   [![zenodo](https://img.shields.io/badge/-10.5281/zenodo.14681109-blue?style=flat-square&logo=zenodo&logoColor=white&labelColor=555&logoSize=auto)](https://doi.org/10.5281/zenodo.14681109)
   [![dblp](https://img.shields.io/badge/dblp-grey?style=flat-square&logo=dblp)](https://dblp.uni-trier.de/rec/conf/cc/UllrichHL25.html?view=bibtex)
   <br><br>
@@ -205,6 +220,14 @@ MimIR is licensed under the [MIT License](https://github.com/mimir/mimir/blob/ma
   [![PDF](https://img.shields.io/badge/PDF-grey?style=flat-square&logo=readthedocs)](https://raw.githubusercontent.com/leissa/leissa/main/pdf/lumh25.pdf)
   [![ACM](https://img.shields.io/badge/ACM-10.1145/3704840-blue?style=flat-square&logo=acm)](https://doi.org/10.1145/3704840)
   [![arXiv](https://img.shields.io/badge/arXiv-10.48550/arXiv.2411.07443-blue?style=flat-square&logo=arxiv)](https://doi.org/10.48550/arXiv.2411.07443)
-  [![zenodo](https://img.shields.io/badge/-10.5281/zenodo.19069678-blue?style=flat-square&logo=zenodo&logoColor=white&labelColor=555&logoSize=auto)](https://doi.org/10.5281/zenodo.19069678)
+  [![zenodo](https://img.shields.io/badge/-10.5281/zenodo.13935445-blue?style=flat-square&logo=zenodo&logoColor=white&labelColor=555&logoSize=auto)](https://doi.org/10.5281/zenodo.13935445)
   [![YouTube](https://img.shields.io/badge/YouTube-grey?style=flat-square&logo=youtube)](https://youtu.be/2zKUa6b9XYc?si=3ZX68gEHarsCsO-R)
   [![dblp](https://img.shields.io/badge/dblp-grey?style=flat-square&logo=dblp)](https://dblp.uni-trier.de/rec/journals/pacmpl/LeissaUMH25.html?view=bibtex)
+
+<div class="section_buttons">
+
+|                          Next |
+| ----------------------------: |
+| [A Tour of MimIR](@ref mimir) |
+
+</div>

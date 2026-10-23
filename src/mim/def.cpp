@@ -2,20 +2,25 @@
 
 #include <algorithm>
 
-#include <absl/container/fixed_array.h>
 #include <fe/assert.h>
+#include <fe/hash.h>
+#include <fe/term.h>
+#include <fe/worklist.h>
 
+#include "mim/driver.h"
 #include "mim/rule.h"
 #include "mim/world.h"
 
-#include "mim/util/hash.h"
-
 using namespace std::literals;
+
+#ifndef DOXYGEN // fe::Patricia is not part of the documented input
+template void fe::Patricia<const mim::Var, mim::DefKey>::Set::dump() const;
+template void fe::Patricia<mim::Def, mim::DefKey>::Set::dump() const;
+#endif
 
 namespace mim {
 
-template void Sets<const Var>::dot();
-template void Sets<Def>::dot();
+std::ostream& DefKey::stream(std::ostream& os, const Def* d) { return os << d->sym() << ": " << d->gid(); }
 
 /*
  * constructors
@@ -28,44 +33,59 @@ Def::Def(World* world, Node node, const Def* type, Defs ops, flags_t flags)
     , mut_(false)
     , external_(false)
     , annex_(false)
-    , dirty_(false)
-    , dep_(node == Node::Hole    ? fe::to_underlying(Dep::Hole)
-           : node == Node::Proxy ? fe::to_underlying(Dep::Proxy)
-           : node == Node::Var   ? fe::to_underlying(Dep::Var | Dep::Mut)
-                                 : 0)
+    , has_hole_(false)
     , num_ops_(ops.size())
     , type_(type) {
-    if (node == Node::Univ) {
-        gid_  = world->next_gid();
-        hash_ = mim::hash_begin(node_t(Node::Univ));
-    } else {
-        hash_ = hash_begin(u8(node));
-        hash_ = hash_combine(hash_, flags_);
-
-        if (type) {
-            world = &type->world();
-            dep_ |= type->dep_;
-            vars_ = type->local_vars();
-            muts_ = type->local_muts();
-            hash_ = hash_combine(hash_, type->gid());
-        } else {
-            world = &ops[0]->world();
-        }
-
-        auto vars = &world->vars();
-        auto muts = &world->muts();
-        auto ptr  = ops_ptr();
-        gid_      = world->next_gid();
-
-        for (size_t i = 0, e = ops.size(); i != e; ++i) {
-            auto op = ops[i];
-            ptr[i]  = op;
-            dep_ |= op->dep_;
-            vars_ = vars->merge(vars_, op->local_vars());
-            muts_ = muts->merge(muts_, op->local_muts());
-            hash_ = hash_combine(hash_, op->gid());
-        }
+    if (node == Node::Level) {
+        hash_ = fe::hash_combine(0, node_t(Node::Level));
+        return;
     }
+
+    // A gid is a u32, so two of them - or a Node and one - share a single hash step.
+    auto h = fe::hash_combine(0, u64(node) << 32 | (type ? type->gid() : 0));
+    h      = fe::hash_combine(h, flags_);
+
+    auto has_hole = type && type->has_hole_;
+
+    auto ptr  = ops_ptr();
+    auto gids = u64(0);
+    for (size_t i = 0, e = ops.size(); i != e; ++i) {
+        auto op = ops[i];
+        ptr[i]  = op;
+        gids    = gids << 32 | op->gid();
+        if (i & 1) h = fe::hash_combine(h, gids), gids = 0;
+        if (node != Node::Proxy || flags & (Proxy::Vars_Bit | Proxy::Muts_Bit)) has_hole |= op->has_hole_;
+    }
+    if (gids) h = fe::hash_combine(h, gids); // gid 0 is never handed out, so this odd tail cannot alias a pair
+
+    has_hole_ = has_hole;
+    hash_     = h;
+}
+
+void Def::collect_locals() {
+    auto vars    = Vars();
+    auto muts    = Muts();
+    auto collect = [&](const Def* d, bool with_vars = true, bool with_muts = true) {
+        auto dvars = with_vars ? d->local_vars() : Vars();
+        auto dmuts = with_muts ? d->local_muts() : Muts();
+        if ((vars && dvars) || (muts && dmuts)) {
+            vars = world().vars().merge(vars, dvars);
+            muts = world().muts().merge(muts, dmuts);
+        } else {
+            if (dvars) vars = dvars;
+            if (dmuts) muts = dmuts;
+        }
+    };
+
+    if (type()) collect(type());
+    for (auto op : ops())
+        if (node() == Node::Proxy)
+            collect(op, flags_ & Proxy::Vars_Bit, flags_ & Proxy::Muts_Bit);
+        else
+            collect(op);
+
+    vars_ = vars;
+    muts_ = muts;
 }
 
 Def::Def(Node n, const Def* type, Defs ops, flags_t flags)
@@ -77,13 +97,10 @@ Def::Def(Node node, const Def* type, size_t num_ops, flags_t flags)
     , mut_(true)
     , external_(false)
     , annex_(false)
-    , dirty_(false)
-    , dep_(fe::to_underlying(Dep::Mut | (node == Node::Hole ? Dep::Hole : Dep::None)))
+    , has_hole_(node == Node::Hole)
     , num_ops_(num_ops)
     , type_(type) {
-    gid_  = world().next_gid();
-    hash_ = mim::hash(gid());
-    var_  = nullptr;
+    var_ = nullptr;
     std::fill_n(ops_ptr(), num_ops, nullptr);
 }
 
@@ -94,90 +111,18 @@ Def::Def(Node node, Def* binder)
     , mut_(false)
     , external_(false)
     , annex_(false)
-    , dirty_(false)
-    , dep_(fe::to_underlying(Dep::Var | Dep::Mut))
+    , has_hole_(false)
     , num_ops_(0)
     , type_(nullptr) {
-    gid_  = binder->world().next_gid();
     vars_ = Vars(as<Var>());
-    hash_ = hash_begin(node_t(Node::Var));
-    hash_ = hash_combine(hash_, binder->gid());
+    hash_ = fe::hash_combine(0, u64(Node::Var) << 32 | binder->gid());
 }
 
 Nat::Nat(World& world)
     : Def(Node, world.type(), Defs{}, 0) {}
 
-UMax::UMax(World& world, Defs ops)
-    : Def(Node, world.univ(), ops, 0) {}
-
-// clang-format off
-
-/*
- * rebuild
- */
-
-const Def* Hole   ::rebuild_(World&,   const Def*,   Defs  ) const { fe::unreachable(); }
-const Def* Global ::rebuild_(World&,   const Def*,   Defs  ) const { fe::unreachable(); }
-const Def* Idx    ::rebuild_(World& w, const Def*  , Defs  ) const { return w.type_idx(); }
-const Def* Nat    ::rebuild_(World& w, const Def*  , Defs  ) const { return w.type_nat(); }
-const Def* Univ   ::rebuild_(World& w, const Def*  , Defs  ) const { return w.univ(); }
-const Def* App    ::rebuild_(World& w, const Def*  , Defs o) const { return w.app(o[0], o[1]); }
-const Def* Arr    ::rebuild_(World& w, const Def*  , Defs o) const { return w.arr(o[0], o[1]); }
-const Def* Extract::rebuild_(World& w, const Def*  , Defs o) const { return w.extract(o[0], o[1]); }
-const Def* Inj    ::rebuild_(World& w, const Def* t, Defs o) const { return w.inj(t, o[0])->set(dbg()); }
-const Def* Insert ::rebuild_(World& w, const Def*  , Defs o) const { return w.insert(o[0], o[1], o[2]); }
-const Def* Lam    ::rebuild_(World& w, const Def* t, Defs o) const { return w.lam(t->as<Pi>(), o[0], o[1]); }
-const Def* Lit    ::rebuild_(World& w, const Def* t, Defs  ) const { return w.lit(t, get()); }
-const Def* Merge  ::rebuild_(World& w, const Def* t, Defs o) const { return w.merge(t, o); }
-const Def* Pack   ::rebuild_(World& w, const Def* t, Defs o) const { return w.pack(t->arity(), o[0]); }
-const Def* Pi     ::rebuild_(World& w, const Def*  , Defs o) const { return w.pi(o[0], o[1], is_implicit()); }
-const Def* Proxy  ::rebuild_(World& w, const Def* t, Defs o) const { return w.proxy(t, o, tag()); }
-const Def* Rule   ::rebuild_(World& w, const Def* t, Defs o) const { return w.rule(t->as<Reform>(), o[0], o[1], o[2]); }
-const Def* Reform ::rebuild_(World& w, const Def* ,  Defs o) const { return w.reform(o[0]); }
-const Def* Sigma  ::rebuild_(World& w, const Def*  , Defs o) const { return w.sigma(o); }
-const Def* Split  ::rebuild_(World& w, const Def* t, Defs o) const { return w.split(t, o[0]); }
-const Def* Match  ::rebuild_(World& w, const Def*  , Defs o) const { return w.match(o); }
-const Def* Tuple  ::rebuild_(World& w, const Def* t, Defs o) const { return w.tuple(t, o); }
-const Def* Type   ::rebuild_(World& w, const Def*  , Defs o) const { return w.type(o[0]); }
-const Def* UInc   ::rebuild_(World& w, const Def*  , Defs o) const { return w.uinc(o[0], offset()); }
-const Def* UMax   ::rebuild_(World& w, const Def*  , Defs o) const { return w.umax(o); }
-const Def* Uniq   ::rebuild_(World& w, const Def*  , Defs o) const { return w.uniq(o[0]); }
-const Def* Var    ::rebuild_(World&,   const Def*,   Defs  ) const { fe::unreachable(); } // binder is in binder_, not an op; rewrite via Rewriter::rewrite_imm_Var
-
-const Def* Axm    ::rebuild_(World& w, const Def* t, Defs ) const {
-    if (&w != &world()) return w.axm(normalizer(), curry(), trip(), t, plugin(), tag(), sub())->set(dbg());
-    assert(Checker::alpha<Checker::Check>(t, type()));
-    return this;
-}
-
-template<bool up> const Def* TExt  <up>::rebuild_(World& w, const Def* t, Defs  ) const { return w.ext  <up>(t)->set(dbg()); }
-template<bool up> const Def* TBound<up>::rebuild_(World& w, const Def*  , Defs o) const { return w.bound<up>(o)->set(dbg()); }
-
-/*
- * stub
- */
-
-Arr*    Arr   ::stub_(World& w, const Def* t) { return w.mut_arr  (t); }
-Global* Global::stub_(World& w, const Def* t) { return w.global   (t, is_mutable()); }
-Hole*   Hole  ::stub_(World& w, const Def* t) { return w.mut_hole (t); }
-Lam*    Lam   ::stub_(World& w, const Def* t) { return w.mut_lam  (t->as<Pi>()); }
-Pack*   Pack  ::stub_(World& w, const Def* t) { return w.mut_pack (t); }
-Pi*     Pi    ::stub_(World& w, const Def* t) { return w.mut_pi   (t, is_implicit()); }
-Rule*   Rule  ::stub_(World& w, const Def* t) { return w.mut_rule(t->as<Reform>()); }
-Sigma*  Sigma ::stub_(World& w, const Def* t) { return w.mut_sigma(t, num_ops()); }
-
-/*
- * instantiate templates
- */
-
-#ifndef DOXYGEN
-template const Def* TExt<false>  ::rebuild_(World&, const Def*, Defs) const;
-template const Def* TExt<true >  ::rebuild_(World&, const Def*, Defs) const;
-template const Def* TBound<false>::rebuild_(World&, const Def*, Defs) const;
-template const Def* TBound<true >::rebuild_(World&, const Def*, Defs) const;
-#endif
-
-// clang-format on
+LMax::LMax(World& world, Defs ops)
+    : Def(Node, world.type_level(), ops, 0) {}
 
 /*
  * immutabilize
@@ -186,48 +131,12 @@ template const Def* TBound<true >::rebuild_(World&, const Def*, Defs) const;
 bool Def::is_immutabilizable() {
     if (!is_set()) return false;
 
-    if (auto v = has_var()) {
-        for (auto op : deps())
-            if (op->free_vars().contains(v)) return false;
-    }
+    auto v = has_var();
     for (auto op : deps()) {
-        for (auto mut : op->local_muts())
-            if (mut == this) return false; // recursion
+        if (v && op->has_free_var(v)) return false;
+        if (op->local_muts().contains(this)) return false; // recursion
     }
     return true;
-}
-
-const Pi* Pi::immutabilize() {
-    if (is_immutabilizable()) return world().pi(dom(), codom());
-    return nullptr;
-}
-
-// TODO should we ever immutabilize Rules?
-const Rule* Rule::immutabilize() { return nullptr; }
-
-const Def* Sigma::immutabilize() {
-    if (is_immutabilizable()) return static_cast<const Sigma*>(world().sigma(ops()));
-    return nullptr;
-}
-
-const Def* Arr::immutabilize() {
-    auto& w = world();
-    if (is_immutabilizable()) return w.arr(arity(), body());
-
-    if (auto n = Lit::isa(arity()); n && *n < w.flags().scalarize_threshold)
-        return w.sigma(DefVec(*n, [&](size_t i) { return reduce(w.lit_idx(*n, i)); }));
-
-    return nullptr;
-}
-
-const Def* Pack::immutabilize() {
-    auto& w = world();
-    if (is_immutabilizable()) return w.pack(arity(), body());
-
-    if (auto n = Lit::isa(arity()); n && *n < w.flags().scalarize_threshold)
-        return w.tuple(DefVec(*n, [&](size_t i) { return reduce(w.lit_idx(*n, i)); }));
-
-    return nullptr;
 }
 
 /*
@@ -235,25 +144,30 @@ const Def* Pack::immutabilize() {
  */
 
 Defs Def::reduce_(const Def* arg) const {
+    if (!is_set()) fe::throwf("cannot reduce `{}`: it is not set", this);
     if (auto var = has_var()) return world().reduce(var, arg);
-    return {ops().begin() + reduction_offset(), num_ops() - reduction_offset()};
-}
-
-const Def* Def::refine(size_t i, const Def* new_op) const {
-    auto new_ops = absl::FixedArray<const Def*>(num_ops());
-    for (size_t j = 0, e = num_ops(); j != e; ++j)
-        new_ops[j] = i == j ? new_op : op(j);
-    return rebuild(type(), new_ops);
+    auto off = reduction_offset();
+    assert(off != size_t(-1) && "not a binder");
+    return {ops().begin() + off, num_ops() - off};
 }
 
 /*
  * Def - set
  */
 
-Def* Def::set(Defs ops) {
+void Def::watch() const {
 #ifdef MIM_ENABLE_CHECKS
     if (world().watchpoints().contains(gid())) fe::breakpoint();
 #endif
+}
+
+Def* Def::finalize() {
+    if (auto t = check()->zonk(); t != type()) type_ = t;
+    return this;
+}
+
+Def* Def::set(Defs ops) {
+    watch();
     invalidate();
 
     size_t n = ops.size();
@@ -268,25 +182,17 @@ Def* Def::set(Defs ops) {
     curr_op_ = n;
 #endif
 
-    if (auto t = check()->zonk(); t != type()) type_ = t;
-
-    return this;
+    return finalize();
 }
 
 Def* Def::set(size_t i, const Def* def) {
-#ifdef MIM_ENABLE_CHECKS
-    if (world().watchpoints().contains(gid())) fe::breakpoint();
-#endif
-
+    watch();
     invalidate();
     def = check(i, def);
     assert(def && !op(i) && curr_op_++ == i);
     ops_ptr()[i] = def;
 
-    if (i + 1 == num_ops()) { // set last op, so check kind
-        if (auto t = check()->zonk(); t != type()) type_ = t;
-    }
-
+    if (i + 1 == num_ops()) return finalize(); // set last op, so check kind
     return this;
 }
 
@@ -301,16 +207,8 @@ Def* Def::unset() {
 #ifndef NDEBUG
     curr_op_ = 0;
 #endif
-    std::ranges::fill(ops_ptr(), ops_ptr() + num_ops(), nullptr);
+    std::fill_n(ops_ptr(), num_ops(), nullptr);
     return this;
-}
-
-bool Def::is_set() const {
-    if (num_ops() == 0) return true;
-    bool result = ops().back();
-    assert((!result || std::ranges::all_of(ops().rsubspan(1), [](auto op) { return op; }))
-           && "the last operand is set but others in front of it aren't");
-    return result;
 }
 
 /*
@@ -322,27 +220,36 @@ const Def* Def::var() {
     return world().var(this);
 }
 
+std::pair<const Var*, std::optional<nat_t>> Var::isa_tproj(const Def* def) {
+    if (auto var = def->isa<Var>()) {
+        if (var->num_tprojs() == 1 && var->proj(1, 0) == var) return {var, 0};
+        return {var, std::nullopt};
+    }
+    if (auto ex = def->isa<Extract>()) {
+        if (auto var = ex->tuple()->isa<Var>()) {
+            // A thresholded Var's only tproj is the Var itself.
+            if (auto i = Lit::isa(ex->index()); i && var->num_tprojs() == var->num_projs()) return {var, i};
+            return {var, std::nullopt};
+        }
+    }
+    return {};
+}
+
+// clang-format off
 const Def* Def::var_type() {
-    auto& w = world();
-
-    // clang-format off
-    if (auto lam  = isa<Lam  >()) return lam->dom();
-    if (auto pi   = isa<Pi   >()) return pi ->dom();
-    if (auto sig  = isa<Sigma>()) return sig;
-    if (auto arr  = isa<Arr  >()) return w.type_idx(arr ->arity()); // TODO shapes like (2, 3)
-    if (auto pack = isa<Pack >()) return w.type_idx(pack->arity()); // TODO shapes like (2, 3)
-    if (auto rule = isa<Rule >()) return rule->type()->dom();
-    if (isa<Bound >()) return this;
-    if (isa<Hole  >()) return nullptr;
-    if (isa<Global>()) return nullptr;
-    // clang-format on
-    fe::unreachable();
+    switch (mut_node()) {
+        case MutNode::Lam:     return as<Lam >()->dom();
+        case MutNode::Pi:      return as<Pi  >()->dom();
+        case MutNode::Rule:    return as<Rule>()->dom();
+        case MutNode::Arr:
+        case MutNode::Pack:    return world().type_indices(as<Seq>()->shape());
+        case MutNode::Sigma:   return this;
+        case MutNode::Hole:
+        case MutNode::Variant: return nullptr;
+    }
+    std::unreachable();
 }
-
-Muts Def::local_muts() const {
-    if (auto mut = isa_mut()) return Muts(mut);
-    return muts_;
-}
+// clang-format on
 
 Vars Def::free_vars() const {
     if (auto mut = isa_mut()) return mut->free_vars();
@@ -355,7 +262,29 @@ Vars Def::free_vars() const {
     return fvs;
 }
 
-Vars Def::local_vars() const { return mut_ ? Vars() : vars_; }
+// free_vars() is a union, so any predicate over it distributes over that union: ask f for the local Vars and
+// then for each local mutable's free_vars() - instead of merging them all into one throw-away Set.
+static bool any_free_vars(const Def* def, std::predicate<Vars> auto f) {
+    if (auto mut = def->isa_mut()) return f(mut->free_vars());
+
+    if (f(def->local_vars())) return true;
+    for (auto mut : def->local_muts())
+        if (f(mut->free_vars())) return true;
+
+    return false;
+}
+
+bool Def::has_free_var(const Var* var) const {
+    return any_free_vars(this, [var](Vars fvs) { return fvs.contains(var); });
+}
+
+bool Def::has_free_vars() const {
+    return any_free_vars(this, [](Vars fvs) { return !fvs.empty(); });
+}
+
+bool Def::has_free_vars_in(Vars vars) const {
+    return vars && any_free_vars(this, [vars](Vars fvs) { return vars.has_intersection(fvs); });
+}
 
 Vars Def::free_vars() {
     if (mark_ == 0) {
@@ -364,19 +293,20 @@ Vars Def::free_vars() {
         auto& w     = world();
         bool cyclic = false;
         w.next_run();
-        free_vars<true>(cyclic, w.next_run());
+        free_vars<true>(w, cyclic, w.next_run());
 
         for (bool todo = cyclic; todo;) {
             todo = false;
-            free_vars<false>(todo, w.next_run());
+            free_vars<false>(w, todo, w.next_run());
         }
     }
 
     return vars_;
 }
 
+// w is threaded through instead of re-deriving it via world() - which chases the type chain - at every node.
 template<bool init>
-Vars Def::free_vars(bool& todo, uint32_t run) {
+Vars Def::free_vars(World& w, bool& todo, u32 run) {
     // If init == true : todo flag detects cycle.
     // If init == false: todo flag keeps track whether sth changed.
     //
@@ -394,7 +324,6 @@ Vars Def::free_vars(bool& todo, uint32_t run) {
 
     auto fvs0  = vars_;
     auto fvs   = fvs0;
-    auto& w    = world();
     auto& muts = w.muts();
     auto& vars = w.vars();
 
@@ -403,7 +332,7 @@ Vars Def::free_vars(bool& todo, uint32_t run) {
 
         for (auto mut : op->local_muts()) {
             if constexpr (init) mut->muts_ = muts.insert(mut->muts_, this); // register "this" as user of local_mut
-            fvs = vars.merge(fvs, mut->free_vars<init>(todo, run));
+            fvs = vars.merge(fvs, mut->free_vars<init>(w, todo, run));
         }
     }
 
@@ -426,122 +355,156 @@ void Def::invalidate() {
 }
 
 bool Def::is_closed() const {
-    if (local_vars().empty() && local_muts().empty()) return true;
-#ifdef MIM_ENABLE_CHECKS
-    assert(!is_external() || free_vars().empty());
-#endif
-    return free_vars().empty();
-}
-
-bool Def::is_open() const {
-    if (!local_vars().empty()) return true;
-    return !free_vars().empty();
+    bool closed = !has_free_vars();
+    assert((!is_external() || closed) && "an external must not have free Vars");
+    return closed;
 }
 
 Def* Def::outermost_binder() const {
-    if (is_closed()) return isa_mut();
-    return (*free_vars().begin())->outermost_binder();
+    auto fvs = free_vars();
+    if (fvs.empty()) return isa_mut();
+    // Terminates: the binder of a free Var of `this` sits strictly further out than `this`.
+    return fvs.min()->binder()->outermost_binder();
 }
 
 bool Def::nests(Def* mut, MutSet& checked) {
-    if (mut->free_vars().contains(this->has_var())) return true;
+    auto var = has_var(); // `this` is fixed across the recursion, and so is its Var
+    auto fvs = mut->free_vars();
+    if (fvs.contains(var)) return true;
     if (auto [_, ins] = checked.emplace(mut); !ins) return false;
 
-    for (auto fv : mut->free_vars())
+    for (auto fv : fvs)
         if (this->nests(fv->binder(), checked)) return true;
 
     return false;
 }
 
 bool Def::nests(Def* mut) {
-    if (this->has_var()) {
-        auto checked = MutSet{};
-        return this->nests(mut, checked);
-    }
-    return false;
+    if (!this->has_var()) return false;
+    auto checked = MutSet();
+    return this->nests(mut, checked);
 }
 
 bool Def::nests(const Def* def) {
     if (auto mut = def->isa_mut()) return this->nests(mut);
+    if (!this->has_var()) return false;
 
-    if (has_var()) {
-        auto checked = MutSet();
-        for (auto fv : def->free_vars())
-            if (this->nests(fv->binder(), checked)) return true;
-    }
+    auto checked = MutSet();
+    for (auto fv : def->free_vars())
+        if (this->nests(fv->binder(), checked)) return true;
+
     return false;
+}
+
+bool Def::in_scope(Def* mut) const {
+    return std::ranges::all_of(free_vars(), [mut](const Var* fv) {
+        auto binder = fv->binder();
+        return binder == mut || binder->nests(mut);
+    });
 }
 
 /*
  * Def - misc
  */
 
+Driver& Def::driver() const noexcept { return world().driver(); }
+fe::Error& Def::error() const noexcept { return driver().error(); }
+
+void Def::bail_expected(fe::Cite what) const {
+    auto loc = err_loc();
+    auto& e  = error().e(loc, "expected {}", what);
+    if (!loc) e.n("got `{}`", this); // no Loc means no snippet showing the offender
+    e.bail();
+}
+
+Loc Def::err_loc() const {
+    auto& w = world();
+    if (auto loc = w.get_loc()) return loc;
+    if (auto loc = this->loc()) return loc;
+
+    // Nothing was pushed and def itself is anonymous: settle for the closest Loc among its deps.
+    auto queue = fe::BFSWorklist<DefSet>{this};
+
+    // Charged per inspected dep, not per dequeue: a single high-arity Def would otherwise scan - and
+    // enqueue - its whole operand list before the budget got a say.
+    constexpr size_t Budget = 512; // a diagnostic is not worth traversing the whole World for
+    auto budget             = Budget;
+
+    while (!queue.empty()) {
+        for (auto dep : queue.pop()->deps()) {
+            if (budget-- == 0) return {};
+            if (!queue.push(dep)) continue;
+            if (auto loc = dep->loc()) return loc;
+        }
+    }
+
+    return {};
+}
+
 Sym Def::sym(const char* s) const { return world().sym(s); }
 Sym Def::sym(std::string_view s) const { return world().sym(s); }
 Sym Def::sym(std::string s) const { return world().sym(std::move(s)); }
 
-World& Def::world() const noexcept {
-    if (auto var = isa<Var>()) return var->binder()->world();
+Dbg Def::dbg() const { return world().driver().dbg(dbg_); }
+void Def::set_dbg(Dbg d) const { dbg_ = world().driver().dbg(d); }
 
-    for (auto def = this;; def = def->type()) {
-        if (def->isa<Univ>()) return *def->world_;
-        if (auto type = def->isa<Type>()) return *type->level()->type()->as<Univ>()->world_;
-    }
+// Fills in only what is missing (unless @p ow) and interns *once* - the old form went through set(Loc) and
+// set(Sym) separately, each re-reading Def::dbg_ and re-interning through the Driver's hash table.
+void Def::set_dbg_(Dbg d, bool ow) const {
+    if (ow) return set_dbg(d);
+
+    auto mine = dbg(), merged = mine;
+    if (!merged.loc()) merged.set(d.loc());
+    if (!merged.sym()) merged.set(d.sym());
+    if (!(merged == mine)) set_dbg(merged);
 }
-const Def* Def::type() const noexcept {
-    if (auto var = isa<Var>()) return var->binder()->var_type();
-    return type_;
+
+void Def::set_dbg_key_(DbgKey key, bool ow) const {
+    // Nothing of ours to preserve, so adopting the index is exactly what set<Ow>(that Dbg) would compute -
+    // but without materialising a Dbg or touching Driver::dbg2idx_ at all.
+    if (ow || !dbg_ || dbg_ == key) return void(dbg_ = key);
+    set_dbg_(world().driver().dbg(key), false); // rare: we carry a partial Dbg, so merge field-wise
 }
 
 const Def* Def::unfold_type() const {
     if (auto t = type()) return t;
     auto& w = world();
-    if (auto t = isa<Type>()) return w.type(w.uinc(t->level()));
-    assert(isa<Univ>());
+    if (auto t = isa<Type>()) return w.type(w.lsucc(t->level()));
+    assert(isa<Level>());
     return nullptr;
 }
 
 std::string_view Def::node_name() const {
-    switch (node()) {
-#define CODE(name, _) \
-    case Node::name: return #name;
+    static constexpr std::string_view Names[Num_Nodes] = {
+#define CODE(node, _) #node,
         MIM_NODE(CODE)
 #undef CODE
-        default: fe::unreachable();
-    }
+    };
+    return Names[node_t(node())];
 }
 
 Defs Def::deps() const noexcept {
-    if (isa<Type>() || isa<Univ>()) return Defs();
-    if (isa<Var>()) return Defs(); // the binder lives in binder_, not in an op
-    assert(type_);
-    return Defs(ops_ptr() - 1, (is_set() ? num_ops_ : 0) + 1);
-}
-
-Judge Def::judge() const noexcept {
-    switch (node()) {
-#define CODE(n, j) \
-    case Node::n: return j;
-        MIM_NODE(CODE)
-#undef CODE
-        default: fe::unreachable();
+    // Level, Type, and Var are the only nodes built without a type - and none of them has deps.
+    if (!type_) {
+        assert(isa<Level>() || isa<Type>() || isa<Var>());
+        return Defs();
     }
+
+    // Not is_set(): its assertion scans *all* ops and deps() is an inner loop.
+    bool set = num_ops_ == 0 || ops_ptr()[num_ops_ - 1];
+    return Defs(ops_ptr() - 1, (set ? num_ops_ : 0) + 1);
 }
 
 bool Def::is_term() const {
-    if (auto t = type()) {
-        if (auto u = t->type()) {
-            if (auto type = u->isa<Type>()) {
-                if (auto level = Lit::isa(type->level())) return *level == 0;
-            }
-        }
-    }
+    if (auto t = type())
+        if (auto u = t->type())
+            if (auto type = u->isa<Type>()) return Lit::isa(type->level()) == nat_t(0);
     return false;
 }
 
 #ifndef NDEBUG
-const Def* Def::debug_prefix(std::string prefix) const { return dbg_.set(world().sym(prefix + sym().str())), this; }
-const Def* Def::debug_suffix(std::string suffix) const { return dbg_.set(world().sym(sym().str() + suffix)), this; }
+const Def* Def::debug_prefix(std::string prefix) const { return set_dbg(dbg().set(sym(prefix + sym().str()))), this; }
+const Def* Def::debug_suffix(std::string suffix) const { return set_dbg(dbg().set(sym(sym().str() + suffix))), this; }
 #endif
 
 /*
@@ -551,8 +514,7 @@ const Def* Def::debug_suffix(std::string suffix) const { return dbg_.set(world()
 Def::Cmp Def::cmp(const Def* a, const Def* b) {
     if (a == b) return Cmp::E;
 
-    if (a->isa_imm() && b->isa_mut()) return Cmp::L;
-    if (a->isa_mut() && b->isa_imm()) return Cmp::G;
+    if (a->is_mutable() != b->is_mutable()) return a->is_mutable() ? Cmp::G : Cmp::L;
 
     // clang-format off
     if (a->node()    != b->node()   ) return a->node()    < b->node()    ? Cmp::L : Cmp::G;
@@ -560,8 +522,7 @@ Def::Cmp Def::cmp(const Def* a, const Def* b) {
     if (a->flags()   != b->flags()  ) return a->flags()   < b->flags()   ? Cmp::L : Cmp::G;
     // clang-format on
 
-    if (a->isa_mut() && b->isa_mut()) return Cmp::U;
-    assert(a->isa_imm() && b->isa_imm());
+    if (a->is_mutable()) return Cmp::U; // two distinct mutables of the same shape are incomparable
 
     if (auto va = a->isa<Var>()) {
         auto vb = b->as<Var>();
@@ -583,7 +544,7 @@ template<Def::Cmp c>
 bool Def::cmp_(const Def* a, const Def* b) {
     auto res = cmp(a, b);
     if (res == Cmp::U) {
-        a->world().WLOG("resorting to unstable gid-based compare for commute check");
+        a->world().log().w("commute check resorts to an unstable gid-based compare");
         return c == Cmp::L ? a->gid() < b->gid() : a->gid() > b->gid();
     }
     return res == c;
@@ -594,25 +555,72 @@ bool Def::less   (const Def* a, const Def* b) { return cmp_<Cmp::L>(a, b); }
 bool Def::greater(const Def* a, const Def* b) { return cmp_<Cmp::G>(a, b); }
 // clang-format on
 
+// clang-format off
+
+/*
+ * dispatch
+ *
+ * All of these used to be `virtual`. Def has no vtable - a vptr would cost 8 bytes on *every* node in the
+ * World - so each is one function switching on Def::node() with the former override inlined right here.
+ */
+
+const Def* Def::immutabilize() {
+    auto& w = world();
+    switch (mut_node()) {
+        case MutNode::Pi: {
+            auto pi = as<Pi>();
+            return is_immutabilizable() ? w.pi(pi->dom(), pi->codom(), pi->is_implicit()) : nullptr;
+        }
+        case MutNode::Sigma:   return is_immutabilizable() ? w.sigma(ops()) : nullptr;
+        case MutNode::Variant: return is_immutabilizable() ? w.variant(ops()) : nullptr;
+        case MutNode::Rule:    return nullptr; // TODO should we ever immutabilize Rules?
+        case MutNode::Lam:
+        case MutNode::Hole:    return nullptr;
+        case MutNode::Arr:
+        case MutNode::Pack: {
+            auto seq = as<Seq>();
+            auto arr = node() == Node::Arr;
+            if (is_immutabilizable())
+                return arr ? w.arr(seq->shape(), seq->body()) : w.pack(seq->shape(), seq->body());
+            // below the threshold an unrollable Seq becomes an explicit Sigma/Tuple
+            if (auto n = seq->shape().is_fused() ? std::nullopt : Lit::isa(seq->arity());
+                n && *n < w.flags().scalarize_threshold) {
+                auto elems = DefVec(*n, [&](size_t i) { return seq->reduce(w.lit_idx(*n, i)); });
+                return arr ? w.sigma(elems) : w.tuple(elems);
+            }
+            return nullptr;
+        }
+    }
+    std::unreachable();
+}
+
+size_t Def::reduction_offset() const noexcept {
+    if (!is_mut_node(node())) return size_t(-1); // only a mutable can bind a Var
+    switch (mut_node()) {
+        case MutNode::Lam:
+        case MutNode::Sigma:   return 0;
+        case MutNode::Arr:
+        case MutNode::Pack:
+        case MutNode::Pi:
+        case MutNode::Rule:    return 1;
+        case MutNode::Hole:
+        case MutNode::Variant: return size_t(-1);
+    }
+    std::unreachable();
+}
+
 const Def* Def::arity() const {
-    if (auto t = type(); t && !t->isa<Type>()) return t->arity();
-    return world().lit_nat_1();
+    switch (node()) {
+        case Node::Arr:
+        case Node::Pack:  return Shape(op(0)).front();
+        case Node::Sigma: return num_ops() != 1 || isa_mut() ? world().lit_nat(num_ops()) : op(0)->arity();
+        default:
+            if (auto t = type(); t && !t->isa<Type>()) return t->arity();
+            return world().lit_nat_1();
+    }
 }
 
-bool Def::equal(const Def* other) const {
-    if (isa<Univ>() || this->isa_mut() || other->isa_mut()) return this == other;
-
-    // A Var carries no ops and flags == 0, so it is identified solely by its binder (stored in binder_).
-    if (auto var = isa<Var>()) return other->isa<Var>() && var->binder() == other->as<Var>()->binder();
-
-    bool result = this->node() == other->node() && this->flags() == other->flags()
-               && this->num_ops() == other->num_ops() && this->type() == other->type();
-
-    for (size_t i = 0, e = num_ops(); result && i != e; ++i)
-        result &= this->op(i) == other->op(i);
-
-    return result;
-}
+// clang-format on
 
 void Def::externalize() { return world().externals().externalize(this); }
 void Def::internalize() { return world().externals().internalize(this); }
@@ -625,30 +633,34 @@ void Def::transfer_external(Def* to) {
 
 std::string Def::unique_name() const { return sym().str() + "_"s + std::to_string(gid()); }
 
-nat_t Def::num_projs() const { return Lit::isa(arity()).value_or(1); }
+static bool is_seq_arity(const Def* def) {
+    if (def->isa<Seq>()) return true;
+    if (auto t = def->type(); t && !t->isa<Type>()) return is_seq_arity(t);
+    return false;
+}
 
 nat_t Def::num_tprojs() const {
-    if (auto a = Lit::isa(arity()); a && *a < world().flags().scalarize_threshold) return *a;
+    if (auto a = Lit::isa(arity()); a && (*a < world().flags().scalarize_threshold || !is_seq_arity(this))) return *a;
     return 1;
 }
 
 const Def* Def::proj(nat_t a, nat_t i) const {
-    World& w = world();
-
     if (a == 1) {
         assert(i == 0 && "only inhabitant of Idx 2 is 0_1");
-        if (!type()) return this;
-        if (!isa_mut<Sigma>() && !type()->isa_mut<Sigma>()) return this;
+        auto t = type();
+        if (!t) return this;
+        if (!isa_mut<Sigma>() && !t->isa_mut<Sigma>()) return this;
     }
 
     if (auto seq = isa<Seq>()) {
-        if (seq->has_var()) return seq->reduce(world().lit_idx(a, i));
-        return seq->body();
+        auto& w = world();
+        if (seq->shape().is_fused()) return w.peel(seq, w.lit_idx(a, i)); // one axis off a fused shape yields a sub-Seq
+        return seq->reduce(w.lit_idx(a, i));
     }
 
     if (isa<Prod>()) return op(i);
 
-    return w.extract(this, a, i);
+    return world().extract(this, a, i); // only compute world() on the path that needs it
 }
 
 /*
@@ -656,30 +668,20 @@ const Def* Def::proj(nat_t a, nat_t i) const {
  */
 
 const Def* Idx::isa(const Def* def) {
-    if (auto app = def->isa<App>()) {
+    if (auto app = def->isa<App>())
         if (app->callee()->isa<Idx>()) return app->arg();
-    }
 
     return nullptr;
 }
 
 std::optional<nat_t> Idx::isa_lit(const Def* def) {
-    if (auto size = Idx::isa(def))
-        if (auto l = Lit::isa(size)) return l;
+    if (auto size = Idx::isa(def)) return Lit::isa(size);
     return {};
 }
 
 std::optional<nat_t> Idx::size2bitwidth(const Def* size) {
-    if (size->isa<Top>()) return 64;
     if (auto s = Lit::isa(size)) return size2bitwidth(*s);
     return {};
 }
-
-/*
- * Global
- */
-
-const App* Global::type() const { return Def::type()->as<App>(); }
-const Def* Global::alloced_type() const { return type()->arg(0); }
 
 } // namespace mim

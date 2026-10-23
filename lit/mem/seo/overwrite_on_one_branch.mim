@@ -1,43 +1,33 @@
-// RUN: %mim %s -o - | %FileCheck %s
+// RUN: %mim %s -p opt -o - | %FileCheck %s --implicit-check-not=mem.slot --implicit-check-not=mem.load
 plugin mem;
 
-cfun dont_know[mem: %mem.M 0]: [%mem.M 0, Bool];
+extern fun dont_know[m: mem.M 0]: [mem.M 0, Bool];
 
-fun extern test1(mem0: %mem.M 0): [%mem.M 0, I64] =
-    ret (mem1, ptr) = %mem.slot (I64, 0) $ mem0;
-    let mem2        = %mem.store (mem1, ptr, 0I64);
-    ret (mem3, ptr2) = %mem.slot (I64, 0) $ mem2;
-    let mem4        = %mem.store (mem3, ptr2, 0I64);
-    head mem4 where
-        con head(mem: %mem.M 0) =
-            ret (mem, cond) = dont_know $ mem;
-            (a, b)#cond mem where
+extern fun test1(m: mem.M 0): [mem.M 0, I64] =
+    ret (m, ptr1) = mem.slot (I64, 0) $ m;
+    let m         = mem.store (m, ptr1, 0I64);
+    ret (m, ptr2) = mem.slot (I64, 0) $ m;
+    let m         = mem.store (m, ptr2, 0I64);
+    head m where
+        con head(m: mem.M 0) =
+            ret (m, cond) = dont_know $ m;
+            (a, b)#cond m where
 
                 // store different values on two branches
-                con a(mem: %mem.M 0) =
-                    let mem = %mem.store (mem, ptr, 1I64);
-                    join mem;
+                con a(m: mem.M 0) =
+                    let m = mem.store (m, ptr1, 1I64);
+                    join m;
 
-                con b(mem: %mem.M 0) =
-                    let mem = %mem.store (mem, ptr2, 0I64);
-                    join mem;
+                con b(m: mem.M 0) =
+                    let m = mem.store (m, ptr2, 0I64);
+                    join m;
 
-                con join(mem: %mem.M 0) =
-                    let (mem, v) = %mem.load (mem, ptr);
-                    return (mem, v);
+                con join(m: mem.M 0) =
+                    let (m, v) = mem.load (m, ptr1);
+                    return (m, v);
             end
     end;
 
-lam extern _compile(): %compile.Phase =
-    %compile.phases tt (
-        %compile.internal_cleanup,
-        %compile.phases tt (
-            %compile.phases tt (
-                %compile.beta_red,
-                %compile.eta_conv,
-            ),
-            %mem.seo,
-        ),
-    );
-
 // CHECK: test1
+// CHECK-DAG: return (m{{.*}}, 1I64)
+// CHECK-DAG: return (m{{.*}}, 0I64)

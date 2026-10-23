@@ -1,0 +1,7 @@
+// RUN: %mim %s
+
+plugin refly;
+
+// An escaped `\"` must not terminate the string literal: `s` is the 3 chars `a`, `"`, `b`.
+let s = "a\"b";
+let _ = refly.struc.e (s, ('a', '"', 'b'));

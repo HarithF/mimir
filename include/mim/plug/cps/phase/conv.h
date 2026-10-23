@@ -15,10 +15,10 @@ namespace mim::plug::cps {
 /// ```
 /// f_cps: Cn [a: A, Cn B]
 /// ```
-/// and every use of `f` is replaced by `%cps.cps2ds_dep (A, λ a: B) f_cps` to remain type-correct.
+/// and every use of `f` is replaced by `cps.cps2ds_dep (A, λ a: B) f_cps` to remain type-correct.
 ///
 /// Call sites are lifted on the fly:
-/// When the recursive rewrite encounters `App (%cps.cps2ds_dep (T, U) k) arg` inside a continuation,
+/// When the recursive rewrite encounters `App (cps.cps2ds_dep (T, U) k) arg` inside a continuation,
 /// it allocates a fresh continuation `cont` receiving the result, records the pending call `k (arg, cont)`,
 /// and uses `cont`'s variable as the value of the App.
 /// Once the enclosing Lam is done, the pending calls are wired up in encounter order - which respects
@@ -34,8 +34,7 @@ namespace mim::plug::cps {
 /// re-derived - and thus re-lifted - in sibling scopes.
 class Conv : public RWPhase {
 public:
-    Conv(World& world, flags_t annex)
-        : RWPhase(world, annex) {}
+    using RWPhase::RWPhase;
 
 private:
     /// A lifted call `callee (arg, cont)` waiting to be wired into the body of the enclosing Lam.
@@ -53,7 +52,7 @@ private:
             : conv_(conv)
             , base_(conv.pending_.size())
             , old_liftable_(conv.liftable_) {
-            conv_.push();
+            conv_.push(Vars());
             conv_.liftable_ = liftable;
         }
         ~Scope() {
@@ -73,11 +72,6 @@ private:
     const Def* rewrite_mut_Lam(Lam*) final;
     const Def* rewrite_imm_App(const App*) final;
 
-    /// Routes rewrites that mention scoped (continuation/binder) variables into the current Lam's map scope;
-    /// everything else goes into the root map and is shared globally.
-    using Rewriter::map;
-    const Def* map(const Def*, const Def*) final;
-
     /// Converts direct-style `f: [a: A] → B` to `f_cps: Cn [a: A, Cn B]` and returns the `cps2ds_dep`-wrapped f_cps.
     const Def* convert(Lam*);
     /// Turns the call `k (arg, cont)` into a Pending entry and returns `cont`'s variable as call result.
@@ -85,8 +79,7 @@ private:
     /// Wires all Pending calls above @p base around @p body and returns the new body.
     const Def* wire(size_t base, const Def* body);
 
-    Vector<Pending> pending_;
-    Vars scoped_;
+    fe::Vector<Pending> pending_;
     bool liftable_ = false;
 };
 

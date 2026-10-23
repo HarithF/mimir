@@ -1,54 +1,46 @@
-#include <absl/container/btree_set.h>
+#include <fe/bitset.h>
+
+#include <mim/tuple.h>
+#include <mim/world.h>
 
 #include <mim/plug/core/core.h>
 
-#include "mim/tuple.h"
-#include "mim/world.h"
-
 #include "mim/plug/vec/vec.h"
-
-#include "absl/container/fixed_array.h"
 
 namespace mim::plug::vec {
 
-template<fold id>
-const Def* normalize_fold(const Def* type, const Def* c, const Def* arg) {
-    auto& w     = c->world();
-    auto callee = c->as<App>();
-    auto f      = callee->arg();
+namespace {
 
+/// The elements of the `n`-vector @p vec, if they are known.
+std::optional<DefVec> elems(const Def* n, const Def* vec) {
+    auto l = Lit::isa(n);
+    if (l == 0) return DefVec();
+    if (l == 1) return DefVec{vec}; // `«1; E»` ≡ `E`, even if `E` is itself an aggregate
+    if (auto tuple = vec->isa<Tuple>()) return DefVec(tuple->ops().begin(), tuple->ops().end());
+    if (auto seq = vec->isa<Seq>(); seq && !seq->shape().is_fused())
+        if (auto a = Lit::isa(seq->arity())) return seq->projs(*a);
+    return {};
+}
+
+} // namespace
+
+template<fold id>
+const Def* normalize_fold(const Def*, const Def* c, const Def* arg) {
+    auto& w         = c->world();
+    auto [_, n, f]  = App::uncurry_args<3>(c);
     auto [acc, vec] = arg->projs<2>();
     if constexpr (id == fold::r) std::swap(acc, vec);
 
-    if (auto tuple = vec->isa<Tuple>()) {
-        if constexpr (id == fold::l)
-            for (auto op : tuple->ops())
-                acc = w.app(f, {acc, op});
-        else // fold::r
-            for (auto op : tuple->ops() | std::views::reverse)
-                acc = w.app(f, {op, acc});
-        return acc;
-    }
+    auto es = elems(n, vec);
+    if (!es) return nullptr;
 
-    if (auto seq = vec->isa<Seq>()) {
-        if (auto n = Lit::isa<u64>(seq->arity()); n && type->isa<Nat>()) {
-            if constexpr (id == fold::l)
-                for (auto proj : seq->projs(*n)) acc = w.app(f, {acc, proj});
-            else // fold::r
-                for (auto proj : seq->projs(*n) | std::views::reverse) acc = w.app(f, {proj, acc});
-            return acc;
-        }
-        w.WLOG("packs with non-literal arity not yet implemented: {}", seq);
-    }
-
-    if (auto l = vec->isa<Lit>()) {
-        if constexpr (id == fold::l)
-            return w.app(f, {acc, l});
-        else
-            return w.app(f, {l, acc});
-    }
-
-    return nullptr;
+    if constexpr (id == fold::l)
+        for (auto e : *es)
+            acc = w.app(f, {acc, e});
+    else // fold::r
+        for (auto e : *es | std::views::reverse)
+            acc = w.app(f, {e, acc});
+    return acc;
 }
 
 const Def* normalize_zip(const Def* type, const Def* c, const Def* arg) {
@@ -60,8 +52,8 @@ const Def* normalize_zip(const Def* type, const Def* c, const Def* arg) {
     if (!ni || !n) return {};
     if (ni >= w.flags().scalarize_threshold || n >= w.flags().scalarize_threshold) return {};
 
-    auto res = absl::FixedArray<const Def*>(*n);
-    auto tup = absl::FixedArray<const Def*>(*ni);
+    auto res = fe::Vector<const Def*, 32>(*n);
+    auto tup = fe::Vector<const Def*, 32>(*ni);
 
     for (size_t j = 0; j != n; ++j) {
         for (size_t i = 0; i != ni; ++i)
@@ -75,26 +67,41 @@ const Def* normalize_zip(const Def* type, const Def* c, const Def* arg) {
 
 template<scan id>
 const Def* normalize_scan(const Def*, const Def* c, const Def* vec) {
-    auto& w     = c->world();
-    auto callee = c->as<App>();
-    auto p      = callee->arg();
+    auto& w        = c->world();
+    auto [_, n, p] = App::uncurry_args<3>(c);
+    if (Lit::isa(n) == 1) return w.app(p, vec);
 
-    if (auto tuple = vec->isa<Tuple>()) {
-        const Def* acc = w.lit_bool(id != scan::exists);
-        for (auto op : tuple->ops())
-            acc = w.call(id == scan::exists ? core::bit2::or_ : core::bit2::and_, 0_n, Defs{acc, w.app(p, op)});
-        return acc;
+    // All elements of `‹s; x›` are `x`, so besides `p x` only whether `s` is empty matters.
+    if (auto pack = vec->isa_imm<Pack>()) {
+        auto shape = pack->shape();
+        auto r     = shape.rank();
+        if (!r) return nullptr;
+
+        auto res = w.app(p, pack->body());
+        for (nat_t i = 0; i != *r; ++i) {
+            // World::seq folds literal-`0` extents away.
+            if (Lit::isa(shape[i])) continue;
+            auto cmp = w.call(id == scan::exists ? core::ncmp::ne : core::ncmp::e, Defs{shape[i], w.lit_nat_0()});
+            res      = w.call(id == scan::exists ? core::bit2::and_ : core::bit2::or_, 0_n, Defs{cmp, res});
+        }
+        return res;
     }
 
-    if (auto pack = vec->isa_imm<Pack>()) w.WLOG("packs not yet implemented: {}", pack);
+    auto es = elems(n, vec);
+    if (!es) return nullptr;
 
-    return nullptr;
+    const Def* acc = w.lit_bool(id != scan::exists);
+    for (auto e : *es)
+        acc = w.call(id == scan::exists ? core::bit2::or_ : core::bit2::and_, 0_n, Defs{acc, w.app(p, e)});
+    return acc;
 }
 
-const Def* normalize_is_unique(const Def*, const Def*, const Def* vec) {
+const Def* normalize_is_unique(const Def*, const Def* callee, const Def* vec) {
     auto& w = vec->world();
+    auto n  = Lit::isa(callee->as<App>()->arg());
+    if (n && *n <= 1) return w.lit_tt();
 
-    if (auto tuple = vec->isa<Tuple>()) {
+    if (auto tuple = vec->isa<Tuple>(); tuple && n) {
         auto seen = DefSet();
         for (auto op : tuple->ops()) {
             auto [_, ins] = seen.emplace(op);
@@ -104,10 +111,8 @@ const Def* normalize_is_unique(const Def*, const Def*, const Def* vec) {
     }
 
     if (auto pack = vec->isa_imm<Pack>()) {
-        if (auto l = Lit::isa(pack->arity())) return w.lit_ff();
+        if (Lit::isa(pack->arity())) return w.lit_ff();
     }
-
-    if (vec->isa<Lit>()) return w.lit_tt();
 
     return nullptr;
 }
@@ -117,8 +122,7 @@ const Def* normalize_cat(const Def*, const Def* callee, const Def* arg) {
     auto [n, m] = callee->as<App>()->decurry()->args<2>([](auto def) { return Lit::isa(def); });
     if (n && *n == 0) return b;
     if (m && *m == 0) return a;
-    if (n && m) return mim::cat_tuple(*n, *m, a, b);
-    return nullptr;
+    return n && m ? Tuple::cat(*n, *m, a, b) : nullptr;
 }
 
 const Def* normalize_diff(const Def* type, const Def* c, const Def* arg) {
@@ -137,12 +141,12 @@ const Def* normalize_diff(const Def* type, const Def* c, const Def* arg) {
     if (auto tup_vec = vec->isa<Tuple>()) {
         if (auto tup_is = is->isa<Tuple>(); tup_is && tup_is->is_closed()) {
             auto defs = DefVec();
-            auto set  = absl::btree_set<nat_t>();
+            auto drop = fe::Bitset();
             for (auto opi : tup_is->ops())
-                set.emplace(Lit::as(opi));
+                drop.set(Lit::as(opi));
 
             for (size_t i = 0, e = tup_vec->num_ops(); i != e; ++i)
-                if (!set.contains(i)) defs.emplace_back(tup_vec->op(i));
+                if (!drop.test(i)) defs.emplace_back(tup_vec->op(i));
             return w.tuple(defs);
         }
         if (auto lit_is = Lit::isa(is)) {

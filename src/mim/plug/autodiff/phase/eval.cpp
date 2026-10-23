@@ -8,31 +8,70 @@
 
 using namespace std::literals;
 
-namespace mim::plug::autodiff {
+namespace mim::plug::autodiff::phase {
+
+/// The high level view is:
+/// ```
+/// f: B -> C
+/// g: A -> B
+/// f o g := λ x. f(g(x)) : A -> C
+/// ```
+/// In CPS the types look like:
+/// ```
+/// f:  Cn[B, Cn C]
+/// g:  Cn[A, Cn B]
+/// h = f o g
+/// h:  Cn[A, cn C]
+/// h = λ (a ret_h) = g (a, h')
+/// h': Cn B
+/// h'= λ b = f (b, ret_h)
+/// ```
+static const Def* compose_cn(const Def* f, const Def* g) {
+    auto& world = f->world();
+    auto F      = f->type()->as<Pi>();
+    auto G      = g->type()->as<Pi>();
+
+    assert(Pi::isa_returning(F));
+    assert(Pi::isa_returning(G));
+
+    auto A = G->dom(2, 0);
+    auto B = G->ret_dom();
+    auto C = F->ret_dom();
+    // The type check of codom G = dom F is better handled by the application type checking
+
+    world.log().d("compose f: {}: {}, g: {}: {}", f, F, g, G);
+    world.log().d("    A = {}, B = {}, C = {}", A, B, C);
+
+    auto name  = "comp_"s + f->sym().str() + "_" + g->sym().str();
+    auto h     = world.mut_fun(A, C)->set(name);
+    auto hcont = world.mut_con(B)->set(name + "_cont");
+
+    h->app(true, g, {h->var(2, 0), hcont});
+
+    auto hcont_var = hcont->var(); // Warning: not var(0) => only one var => normalization flattens tuples down here.
+    hcont->app(true, f, {hcont_var, h->var(2, 1) /* ret_var */});
+
+    return h;
+}
 
 // TODO: maybe use template (https://codereview.stackexchange.com/questions/141961/memoization-via-template) to memoize
 const Def* Eval::augment(const Def* def, Lam* f, Lam* f_diff) {
-    if (auto i = augmented.find(def); i != augmented.end()) return i->second;
-    augmented[def] = augment_(def, f, f_diff);
-    return augmented[def];
+    if (auto res = fe::lookup(augmented, def)) return res;
+    return augmented[def] = augment_(def, f, f_diff);
 }
 
 const Def* Eval::derive(const Def* def) {
-    if (auto i = derived.find(def); i != derived.end()) return i->second;
-    derived[def] = derive_(def);
-    return derived[def];
+    if (auto res = fe::lookup(derived, def)) return res;
+    return derived[def] = derive_(def);
 }
 
 const Def* Eval::rewrite_imm_App(const App* app) {
-    if (is_bootstrapping()) return RWPhase::rewrite_imm_App(app);
-
     if (auto ad_app = Axm::isa<ad>(app); ad_app) {
         // callee = autodiff T
         // arg = function of type T
         //   (or operator)
         // Rewrite the argument into the new world first; the whole derivation then works on that copy.
         auto arg = rewrite(ad_app->arg());
-        DLOG("found a autodiff::autodiff of {}", arg);
 
         if (arg->isa<Lam>()) return derive(arg);
 
@@ -51,8 +90,7 @@ const Def* Eval::rewrite_imm_App(const App* app) {
 
 /// Additionally to the derivation, the pullback is registered and the maps are initialized.
 const Def* Eval::derive_(const Def* def) {
-    auto lam = def->as_mut<Lam>(); // TODO check if mutable
-    DLOG("Derive lambda: {}", def);
+    auto lam      = def->as_mut<Lam>(); // TODO check if mutable
     auto deriv_ty = autodiff_type_fun_pi(lam->type());
     auto deriv    = world().mut_lam(deriv_ty)->set(lam->sym().str() + "_deriv");
 
@@ -64,7 +102,7 @@ const Def* Eval::derive_(const Def* def) {
 
     auto [arg_ty, ret_pi] = lam->type()->doms<2>();
     auto deriv_all_args   = deriv->var();
-    const Def* deriv_arg  = deriv->var(0uz)->set("arg");
+    const Def* deriv_arg  = deriv->var(2, 0)->set("arg");
 
     // We generate the shadow pullbacks dynamically to save work and avoid code duplication.
     // Only the toplevel pullback for arguments and return continuation is special cased.
@@ -74,23 +112,17 @@ const Def* Eval::derive_(const Def* def) {
     auto arg_id_pb              = id_pullback(arg_ty);
     partial_pullback[deriv_arg] = arg_id_pb;
     // The return continuation has to formally exist but should never be directly accessed.
-    auto ret_var              = deriv->var(1);
-    auto ret_pb               = zero_pullback(lam->var(1)->type(), arg_ty);
+    auto ret_var              = deriv->var(2, 1);
+    auto ret_pb               = zero_pullback(lam->var(2, 1)->type(), arg_ty);
     partial_pullback[ret_var] = ret_pb;
 
     shadow_pullback[deriv_all_args] = world().tuple({arg_id_pb, ret_pb});
-    DLOG("pullback for argument {} : {} is {} : {}", deriv_arg, deriv_arg->type(), arg_id_pb, arg_id_pb->type());
-    DLOG("args shadow pb is {} : {}", shadow_pullback[deriv_all_args], shadow_pullback[deriv_all_args]->type());
 
     // We pre-register the augment replacements.
     // The function and its variables are replaced by their new derived versions.
     // TODO: maybe leave out function call (duplication with derived)
-    augmented[def] = deriv;
-    DLOG("Associate {} with {}", def, deriv);
-    DLOG("  {} : {}", lam, lam->type());
-    DLOG("  {} : {}", deriv, deriv->type());
+    augmented[def]        = deriv;
     augmented[lam->var()] = deriv->var();
-    DLOG("Associate vars {} with {}", lam->var(), deriv->var());
 
     // already contains the correct application of
     // deriv->ret_var() by specification
@@ -119,6 +151,12 @@ const Def* Eval::augment_lit(const Lit* lit, Lam* f, Lam*) {
     return lit;
 }
 
+const Def* Eval::pullback(const Def* aug, Lam* f) {
+    // A singleton has no tangent, and its sole inhabitant is shared by all functions.
+    if (world().inhabitant(aug->type()) == aug) return zero_pullback(aug->type(), f->dom(2, 0));
+    return partial_pullback[aug];
+}
+
 const Def* Eval::augment_var(const Var* var, Lam*, Lam*) {
     assert(augmented.count(var));
     auto aug_var = augmented[var];
@@ -135,7 +173,6 @@ const Def* Eval::augment_lam(Lam* lam, Lam* f, Lam* f_diff) {
         // * recursion
         // * higher order arguments
         // * new encounter of previous function
-        DLOG("already augmented {} : {} to {} : {}", lam, lam->type(), augmented[lam], augmented[lam]->type());
         return augmented[lam];
     }
     // TODO: better fix (another pass as analysis?)
@@ -149,18 +186,15 @@ const Def* Eval::augment_lam(Lam* lam, Lam* f, Lam* f_diff) {
         // There is dependency on the closed function context.
         // (All derivatives are with respect to the arguments of a closed function.)
 
-        DLOG("found an open continuation {} : {}", lam, lam->type());
-        auto cont_dom = lam->type()->dom(); // not only 0 but all
-        auto pb_ty    = pullback_type(cont_dom, f->dom(2, 0));
-        auto aug_dom  = autodiff_type_fun(cont_dom);
-        DLOG("augmented domain {}", aug_dom);
-        DLOG("pb type is {}", pb_ty);
+        auto cont_dom             = lam->type()->dom(); // not only 0 but all
+        auto pb_ty                = pullback_type(cont_dom, f->dom(2, 0));
+        auto aug_dom              = autodiff_type_fun(cont_dom);
         auto aug_lam              = world().mut_con({aug_dom, pb_ty})->set("aug_"s + lam->sym().str());
-        auto aug_var              = aug_lam->var((nat_t)0);
+        auto aug_var              = aug_lam->var(2, 0);
         augmented[lam->var()]     = aug_var;
         augmented[lam]            = aug_lam; // TODO: only one of these two
         derived[lam]              = aug_lam;
-        auto pb                   = aug_lam->var(1);
+        auto pb                   = aug_lam->var(2, 1);
         partial_pullback[aug_var] = pb;
         // We are still in same closed function.
         auto new_body = augment(lam->body(), f, f_diff);
@@ -169,19 +203,14 @@ const Def* Eval::augment_lam(Lam* lam, Lam* f, Lam* f_diff) {
 
         auto lam_pb               = zero_pullback(lam->type(), f->dom(2, 0));
         partial_pullback[aug_lam] = lam_pb;
-        DLOG("augmented {} : {}", lam, lam->type());
-        DLOG("to {} : {}", aug_lam, aug_lam->type());
-        DLOG("ppb for lam cont: {}", lam_pb);
 
         return aug_lam;
     }
-    DLOG("found a closed function call {} : {}", lam, lam->type());
     // Some general function in the program needs to be differentiated.
-    // The old pass emitted a new `%autodiff.ad` application here and relied on the PassMan to revisit it;
+    // The old pass emitted a new `autodiff.ad` application here and relied on the PassMan to revisit it;
     // as a Phase we derive eagerly instead (derive() pre-registers itself, so recursion terminates).
     auto aug_lam = derive(lam);
     // TODO: directly more association here? => partly inline op_autodiff
-    DLOG("augmented function is {} : {}", aug_lam, aug_lam->type());
     return aug_lam;
 }
 
@@ -193,26 +222,22 @@ const Def* Eval::augment_extract(const Extract* ext, Lam* f, Lam* f_diff) {
     auto aug_index = augment(index, f, f_diff);
 
     const Def* pb;
-    DLOG("tuple was: {} : {}", tuple, tuple->type());
-    DLOG("aug tuple: {} : {}", aug_tuple, aug_tuple->type());
     if (shadow_pullback.count(aug_tuple)) {
         auto shadow_tuple_pb = shadow_pullback[aug_tuple];
-        DLOG("Shadow pullback: {} : {}", shadow_tuple_pb, shadow_tuple_pb->type());
-        pb = world().extract(shadow_tuple_pb, aug_index);
+        pb                   = world().extract(shadow_tuple_pb, aug_index);
     } else {
         // ```
         // e:T, b:B
         // b = e#i
         // b* = \lambda (s:B). e* (insert s at i in (zero T))
         // ```
-        assert(partial_pullback.count(aug_tuple));
-        auto tuple_pb = partial_pullback[aug_tuple];
-        auto pb_ty    = pullback_type(ext->type(), f->dom(2, 0));
-        auto pb_fun   = world().mut_lam(pb_ty)->set("extract_pb");
-        DLOG("Pullback: {} : {}", pb_fun, pb_fun->type());
-        auto pb_tangent = pb_fun->var(0uz)->set("s");
+        auto tuple_pb = pullback(aug_tuple, f);
+        assert(tuple_pb);
+        auto pb_ty      = pullback_type(ext->type(), f->dom(2, 0));
+        auto pb_fun     = world().mut_lam(pb_ty)->set("extract_pb");
+        auto pb_tangent = pb_fun->var(2, 0)->set("s");
         auto tuple_tan  = world().insert(world().call<zero>(aug_tuple->type()), aug_index, pb_tangent)->set("tup_s");
-        pb_fun->app(true, tuple_pb, {tuple_tan, pb_fun->var(1) /* ret_var but make sure to select correct one */});
+        pb_fun->app(true, tuple_pb, {tuple_tan, pb_fun->var(2, 1) /* ret_var but make sure to select correct one */});
         pb = pb_fun;
     }
 
@@ -227,8 +252,7 @@ const Def* Eval::augment_tuple(const Tuple* tup, Lam* f, Lam* f_diff) {
     auto aug_ops = tup->projs([&](const Def* op) -> const Def* { return augment(op, f, f_diff); });
     auto aug_tup = world().tuple(aug_ops);
 
-    auto pbs = DefVec(Defs(aug_ops), [&](const Def* op) { return partial_pullback[op]; });
-    DLOG("tuple pbs {}", fe::Join(pbs));
+    auto pbs = DefVec(Defs(aug_ops), [&](const Def* op) { return pullback(op, f); });
     // shadow pb = tuple of pbs
     auto shadow_pb           = world().tuple(pbs);
     shadow_pullback[aug_tup] = shadow_pb;
@@ -240,15 +264,12 @@ const Def* Eval::augment_tuple(const Tuple* tup, Lam* f, Lam* f_diff) {
     // ```
     auto pb_ty = pullback_type(tup->type(), f->dom(2, 0));
     auto pb    = world().mut_lam(pb_ty)->set("tup_pb");
-    DLOG("Augmented tuple: {} : {}", aug_tup, aug_tup->type());
-    DLOG("Tuple Pullback: {} : {}", pb, pb->type());
-    DLOG("shadow pb: {} : {}", shadow_pb, shadow_pb->type());
 
-    auto pb_tangent = pb->var(0uz)->set("tup_s");
+    auto pb_tangent = pb->var(2, 0)->set("tup_s");
 
     auto tangents = DefVec(
         pbs.size(), [&](nat_t i) { return world().app(cps::op_cps2ds_dep(pbs[i]), world().extract(pb_tangent, i)); });
-    pb->app(true, pb->var(1),
+    pb->app(true, pb->var(2, 1),
             // summed up tangents
             op_sum(tangent_type_fun(f->dom(2, 0)), tangents));
     partial_pullback[aug_tup] = pb;
@@ -265,33 +286,26 @@ const Def* Eval::augment_pack(const Pack* pack, Lam* f, Lam* f_diff) {
 
     auto aug_pack = world().pack(aug_arity, aug_body);
 
-    assert(partial_pullback[aug_body] && "pack pullback should exists");
     // TODO: or use scale axm
-    auto body_pb              = partial_pullback[aug_body];
+    auto body_pb = pullback(aug_body, f);
+    assert(body_pb && "pack pullback should exists");
     auto pb_pack              = world().pack(aug_arity, body_pb);
     shadow_pullback[aug_pack] = pb_pack;
-
-    DLOG("shadow pb of pack: {} : {}", pb_pack, pb_pack->type());
 
     auto pb_type = pullback_type(pack->type(), f->dom(2, 0));
     auto pb      = world().mut_lam(pb_type)->set("pack_pb");
 
-    DLOG("pb of pack: {} : {}", pb, pb_type);
-
     auto f_arg_ty_diff = tangent_type_fun(f->dom(2, 0));
-    auto app_pb        = world().mut_pack(world().arr(aug_arity, f_arg_ty_diff));
+    auto app_pb        = world().mut_pack(world().arr(aug_arity, f_arg_ty_diff))->set_shape(aug_arity);
 
     // TODO: special case for const width (special tuple)
 
     // <i:n, cps2ds body_pb (s#i)>
-    app_pb->set(world().app(cps::op_cps2ds_dep(body_pb), world().extract(pb->var((nat_t)0), app_pb->var())));
-
-    DLOG("app pb of pack: {} : {}", app_pb, app_pb->type());
+    app_pb->set_body(world().app(cps::op_cps2ds_dep(body_pb), world().extract(pb->var(2, 0), app_pb->var())));
 
     auto sumup = world().app(world().annex<sum>(), {aug_arity, f_arg_ty_diff});
-    DLOG("sumup: {} : {}", sumup, sumup->type());
 
-    pb->app(true, pb->var(1), world().app(sumup, app_pb));
+    pb->app(true, pb->var(2, 1), world().app(sumup, app_pb));
 
     partial_pullback[aug_pack] = pb;
 
@@ -305,20 +319,12 @@ const Def* Eval::augment_app(const App* app, Lam* f, Lam* f_diff) {
     auto aug_arg    = augment(arg, f, f_diff);
     auto aug_callee = augment(callee, f, f_diff);
 
-    DLOG("augmented argument <{}> {} : {}", aug_arg->unique_name(), aug_arg, aug_arg->type());
-    DLOG("augmented callee  <{}> {} : {}", aug_callee->unique_name(), aug_callee, aug_callee->type());
     // TODO: move down to if(!is_cont(callee))
-    if (!Pi::isa_cn(callee->type()) && Pi::isa_cn(aug_callee->type())) {
-        aug_callee = cps::op_cps2ds_dep(aug_callee);
-        DLOG("wrapped augmented callee: <{}> {} : {}", aug_callee->unique_name(), aug_callee, aug_callee->type());
-    }
+    if (!Pi::isa_cn(callee->type()) && Pi::isa_cn(aug_callee->type())) aug_callee = cps::op_cps2ds_dep(aug_callee);
 
     // nested (inner application)
     if (app->type()->isa<Pi>()) {
-        DLOG("Nested application callee: {} : {}", aug_callee, aug_callee->type());
-        DLOG("Nested application arg: {} : {}", aug_arg, aug_arg->type());
         auto aug_app = world().app(aug_callee, aug_arg);
-        DLOG("Nested application result: <{}> {} : {}", aug_app->unique_name(), aug_app, aug_app->type());
         // We do not add a pullback as the pullback is bundled in the cps call or returned by the ds call
         return aug_app;
     }
@@ -332,136 +338,87 @@ const Def* Eval::augment_app(const App* app, Lam* f, Lam* f_diff) {
 
         // ret(e) => ret'(e, e*)
 
-        DLOG("continuation {} : {} => {} : {}", callee, callee->type(), aug_callee, aug_callee->type());
-
-        auto arg_pb  = partial_pullback[aug_arg];
+        auto arg_pb  = pullback(aug_arg, f);
         auto aug_app = world().app(aug_callee, {aug_arg, arg_pb});
-        DLOG("Augmented application: {} : {}", aug_app, aug_app->type());
         return aug_app;
     }
 
     // ds function
     if (!Pi::isa_cn(callee->type())) {
         auto aug_app = world().app(aug_callee, aug_arg);
-        DLOG("Augmented application: <{}> {} : {}", aug_app->unique_name(), aug_app, aug_app->type());
 
-        DLOG("ds function: {} : {}", aug_app, aug_app->type());
         // The calle is ds function (e.g. operator (or its partial application))
         auto [aug_res, fun_pb] = aug_app->projs<2>();
         // We compose `fun_pb` with `argument_pb` to get the result pb
         // TODO: combine case with cps function case
-        auto arg_pb = partial_pullback[aug_arg];
+        auto arg_pb = pullback(aug_arg, f);
         assert(arg_pb);
         // `fun_pb: out_tan -> arg_tan`
         // `arg_pb: arg_tan -> fun_tan`
-        DLOG("function pullback: {} : {}", fun_pb, fun_pb->type());
-        DLOG("argument pullback: {} : {}", arg_pb, arg_pb->type());
-        auto res_pb = compose_cn(arg_pb, fun_pb);
-        DLOG("result pullback: {} : {}", res_pb, res_pb->type());
+        auto res_pb               = compose_cn(arg_pb, fun_pb);
         partial_pullback[aug_res] = res_pb;
-        world().debug_dump();
         return aug_res;
     }
 
     // TODO: dest with a function such that f args != g args
-    {
-        // normal function app
-        // ```
-        // g: cn[E, cn X]
-        // g(args,cont)
-        // g': cn[E, cn[X, cn[X, cn E]]]
-        // g'(aug_args, ____)
-        // ```
-        auto g = callee;
-        // At this point g_deriv might still be "autodiff ... g".
-        auto g_deriv = aug_callee;
-        DLOG("g: {} : {}", g, g->type());
-        DLOG("g': {} : {}", g_deriv, g_deriv->type());
+    // normal function app
+    // ```
+    // g: cn[E, cn X]
+    // g(args,cont)
+    // g': cn[E, cn[X, cn[X, cn E]]]
+    // g'(aug_args, ____)
+    // ```
+    // At this point g_deriv might still be "autodiff ... g".
+    auto g_deriv = aug_callee;
 
-        auto [real_aug_args, aug_cont] = aug_arg->projs<2>();
-        DLOG("real_aug_args: {} : {}", real_aug_args, real_aug_args->type());
-        DLOG("aug_cont: {} : {}", aug_cont, aug_cont->type());
-        auto e_pb = partial_pullback[real_aug_args];
-        DLOG("e_pb (arg_pb): {} : {}", e_pb, e_pb->type());
+    auto [real_aug_args, aug_cont] = aug_arg->projs<2>();
+    auto e_pb                      = pullback(real_aug_args, f);
 
-        // TODO: better debug names
-        auto ret_g_deriv_ty = g_deriv->type()->as<Pi>()->dom(1);
-        DLOG("ret_g_deriv_ty: {} ", ret_g_deriv_ty);
-        auto c1_ty = ret_g_deriv_ty->as<Pi>();
-        DLOG("c1_ty: (cn[X, cn[X+, cn E+]]) {}", c1_ty);
-        auto c1   = world().mut_lam(c1_ty)->set("c1");
-        auto res  = c1->var((nat_t)0);
-        auto r_pb = c1->var(1);
-        c1->app(true, aug_cont, {res, compose_cn(e_pb, r_pb)});
+    // TODO: better debug names
+    auto ret_g_deriv_ty = g_deriv->type()->as<Pi>()->dom(2, 1);
+    auto c1_ty          = ret_g_deriv_ty->as<Pi>();
+    auto c1             = world().mut_lam(c1_ty)->set("c1");
+    auto res            = c1->var(2, 0);
+    auto r_pb           = c1->var(2, 1);
+    c1->app(true, aug_cont, {res, compose_cn(e_pb, r_pb)});
 
-        auto aug_app = world().app(aug_callee, {real_aug_args, c1});
-        DLOG("aug_app: {} : {}", aug_app, aug_app->type());
+    auto aug_app = world().app(aug_callee, {real_aug_args, c1});
 
-        // The result is * => no pb needed, no composition needed.
-        return aug_app;
-    }
-    assert(false && "should not be reached");
+    // The result is * => no pb needed, no composition needed.
+    return aug_app;
 }
 
 /// Rewrites the given definition in a lambda environment.
 const Def* Eval::augment_(const Def* def, Lam* f, Lam* f_diff) {
-    // We use macros above to avoid recomputation.
-    // TODO: Alternative:
-    // Use class instances to rewrite inside a function and save such values (f, f_diff, f->dom(2, 0)).
-
-    DLOG("Augment def {} : {}", def, def->type());
-
-    // Applications are continuations, operators, or full functions
+    // Applications are continuations, operators, or full functions.
     if (auto app = def->isa<App>()) {
-        auto callee = app->callee();
-        auto arg    = app->arg();
-        DLOG("Augment application: app {} with {}", callee, arg);
         return augment_app(app, f, f_diff);
     } else if (auto ext = def->isa<Extract>()) {
-        auto tuple = ext->tuple();
-        auto index = ext->index();
-        DLOG("Augment extract: {} #[{}]", tuple, index);
         return augment_extract(ext, f, f_diff);
     } else if (auto var = def->isa<Var>()) {
-        DLOG("Augment variable: {}", var);
         return augment_var(var, f, f_diff);
     } else if (auto lam = def->isa_mut<Lam>()) {
-        DLOG("Augment mut lambda: {}", lam);
         return augment_lam(lam, f, f_diff);
     } else if (auto lam = def->isa<Lam>()) {
-        ELOG("Augment lambda: {}", lam);
+        log().e("cannot augment an immutable Lam: {}", lam);
         assert(false && "can not handle non-mutable lambdas");
     } else if (auto lit = def->isa<Lit>()) {
-        DLOG("Augment literal: {}", def);
         return augment_lit(lit, f, f_diff);
     } else if (auto tup = def->isa<Tuple>()) {
-        DLOG("Augment tuple: {}", def);
         return augment_tuple(tup, f, f_diff);
     } else if (auto pack = def->isa<Pack>()) {
         // TODO: handle mut packs (dependencies in the pack) (=> see paper about vectors)
-        auto arity = pack->arity(); // TODO: arity vs shape
-        auto body  = pack->body();
-        DLOG("Augment pack: {} : {} with {}", arity, arity->type(), body);
         return augment_pack(pack, f, f_diff);
     } else if (auto ax = def->isa<Axm>()) {
-        //  TODO: move concrete handling to own function / file / directory (file per plugin)
-        DLOG("Augment axm: {} : {}", ax, ax->type());
-        DLOG("axm curry: {}", ax->curry());
-        DLOG("axm flags: {}", ax->flags());
         auto diff_name = ax->sym().str();
-        find_and_replace(diff_name, ".", "_");
-        find_and_replace(diff_name, "%", "");
-        diff_name = "internal_diff_" + diff_name;
-        DLOG("axm name: {}", ax->sym());
-        DLOG("axm function name: {}", diff_name);
+        fe::find_and_replace(diff_name, ".", "_");
+        diff_name = "autodiff.diff." + diff_name;
 
-        // Look the derivative up in the old world: the new world's externals are still being populated while this
-        // phase runs, so an internal_diff_* function may not have been carried over yet.
-        auto old_diff_fun = old_world().externals()[old_world().sym(diff_name)];
+        // Look the derivative up in the old world; rewrite() below maps it into the new one.
+        auto old_diff_fun = old_world().annex(old_world().sym(diff_name));
         if (!old_diff_fun) {
-            ELOG("derivation not found: {}", diff_name);
             auto expected_type = autodiff_type_fun(ax->type());
-            ELOG("expected: {} : {}", diff_name, expected_type);
+            log().e("no derivative `{}`; expected type: {}", diff_name, expected_type);
             assert(false && "unhandled axm");
         }
         // TODO: why does this cause a depth error?
@@ -471,10 +428,9 @@ const Def* Eval::augment_(const Def* def, Lam* f, Lam* f_diff) {
     // TODO: handle Pi for axm app
     // TODO: remaining (lambda, axm)
 
-    ELOG("did not expect to augment: {} : {}", def, def->type());
-    ELOG("node: {}", def->node_name());
+    log().e("cannot augment {} node {}: {}", def->node_name(), def, def->type());
     assert(false && "augment not implemented on this def");
-    fe::unreachable();
+    std::unreachable();
 }
 
-} // namespace mim::plug::autodiff
+} // namespace mim::plug::autodiff::phase

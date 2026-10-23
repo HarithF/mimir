@@ -1,0 +1,29 @@
+// RUN: %mim -p opt %s -o - | %FileCheck %s
+
+// A strided slice reads the pure map producer injectively — every loop index is used, just
+// scaled/shifted — so the fuse phase must collapse the two ops. Fusion here even drops work:
+// the add1 elements the slice skips are never computed.
+plugin core;
+plugin tensor;
+plugin compile;
+
+use core.ops.n;
+use tensor;
+
+lam add1 (x: Nat): Nat = x + 1;
+
+extern con f (v: «4, 6; Nat», return: Cn «2, 3; Nat») =
+    let v = buf v;
+    let inner = unary add1 v;
+    return (slice (4, 6) ((1, 0), (2, 2), (2, 3)) inner);
+
+extern lam _compile (): compile.Phase =
+    compile.phases ff (
+        compile.cleanup,
+        lower_tensor,
+        fuse_tensor,
+        compile.cleanup,
+    );
+
+// CHECK: tensor.map_reduce
+// CHECK-NOT: tensor.map_reduce

@@ -2,24 +2,20 @@
 #include <iterator>
 #include <numeric>
 #include <ranges>
-#include <vector>
 
 #include <automaton/range_helper.h>
 #include <fe/assert.h>
 
-#include "mim/axm.h"
-#include "mim/def.h"
-#include "mim/tuple.h"
-#include "mim/world.h"
+#include <mim/axm.h>
+#include <mim/def.h>
+#include <mim/driver.h>
+#include <mim/tuple.h>
+#include <mim/world.h>
 
-#include "mim/util/dbg.h"
-#include "mim/util/log.h"
-
-#include "mim/plug/regex/autogen.h"
 #include "mim/plug/regex/regex.h"
 
 using Range  = automaton::Range;
-using Ranges = mim::Vector<Range>;
+using Ranges = fe::Vector<Range>;
 
 namespace mim::plug::regex {
 
@@ -61,11 +57,11 @@ const Def* make_binary_tree(Defs args) {
 
 const Def* normalize_conj(const Def* type, const Def* callee, const Def* arg) {
     auto& world = type->world();
-    world.DLOG("conj {}:{} ({})", type, callee, arg);
+    world.log().d("conj {}: {} ({})", callee, type, arg);
 
     if (auto a = Lit::isa(arg->arity())) {
         switch (*a) {
-            case 0: return world.lit_tt();
+            case 0: return world.annex<empty>();
             case 1: return arg;
             default:
                 if (auto args = detail::flatten_in_arg<conj>(arg); !args.empty())
@@ -78,11 +74,16 @@ const Def* normalize_conj(const Def* type, const Def* callee, const Def* arg) {
     return {};
 }
 
+const App* lit_range(const Def* d) {
+    if (auto r = Axm::isa<range>(d); r && r->arg(2, 0)->isa<Lit>() && r->arg(2, 1)->isa<Lit>()) return r;
+    return nullptr;
+}
+
 bool compare_re(const Def* lhs, const Def* rhs) {
-    auto lhs_range = Axm::isa<range>(lhs);
-    auto rhs_range = Axm::isa<range>(rhs);
+    auto lhs_range = lit_range(lhs);
+    auto rhs_range = lit_range(rhs);
     // sort ranges by increasing lower bound
-    if (lhs_range && rhs_range) return Lit::as(lhs_range->arg()->proj(0)) < Lit::as(rhs_range->arg()->proj(0));
+    if (lhs_range && rhs_range) return Lit::as(lhs_range->arg(2, 0)) < Lit::as(rhs_range->arg(2, 0));
     // ranges to the end
     if (lhs_range) return false;
     if (rhs_range) return true;
@@ -98,11 +99,9 @@ void make_vector_unique(DefVec& args) {
     }
 }
 
-bool is_in_range(Range range, nat_t needle) { return needle >= range.first && needle <= range.second; }
-
 auto get_range(const Def* rng) -> Range {
     auto rng_match = Axm::isa<range, false>(rng);
-    return {Lit::as<std::uint8_t>(rng_match->arg(0)), Lit::as<std::uint8_t>(rng_match->arg(1))};
+    return {Lit::as<std::uint8_t>(rng_match->arg(2, 0)), Lit::as<std::uint8_t>(rng_match->arg(2, 1))};
 }
 
 struct app_range {
@@ -112,7 +111,7 @@ struct app_range {
 
 void merge_ranges(DefVec& args) {
     auto ranges_begin = args.begin();
-    while (ranges_begin != args.end() && !Axm::isa<range>(*ranges_begin))
+    while (ranges_begin != args.end() && !lit_range(*ranges_begin))
         ranges_begin++;
     if (ranges_begin == args.end()) return;
 
@@ -121,18 +120,13 @@ void merge_ranges(DefVec& args) {
 
     std::transform(ranges_begin, args.end(), std::back_inserter(old_ranges), get_range);
 
-    auto new_ranges = automaton::merge_ranges(old_ranges, [&world](std::string_view msg) { world.DLOG("{}", msg); });
+    auto new_ranges = automaton::merge_ranges(old_ranges, [&world](std::string_view msg) { world.log().d("{}", msg); });
 
     // invalidates ranges_begin
     args.erase(ranges_begin, args.end());
     std::transform(new_ranges.begin(), new_ranges.end(), std::back_inserter(args), app_range{world});
 
     make_vector_unique(args);
-}
-
-template<cls A, cls B>
-bool equals_any(const Def* cls0, const Def* cls1) {
-    return (Axm::isa(A, cls0) && Axm::isa(B, cls1)) || (Axm::isa(A, cls1) && Axm::isa(B, cls0));
 }
 
 bool equals_any(const Def* lhs, const Def* rhs) {
@@ -148,8 +142,7 @@ bool equals_any(const Def* lhs, const Def* rhs) {
 }
 
 bool equals_any(Defs lhs, Defs negated_rhs) {
-    auto is_range = [](const Def* d) { return Axm::isa<range>(d); };
-    auto to_range = std::views::filter(is_range) | std::views::transform(get_range);
+    auto to_range = std::views::filter(lit_range) | std::views::transform(get_range);
     auto rhs_view = negated_rhs | to_range;
 
     if (std::ranges::distance(rhs_view) != std::ranges::distance(negated_rhs)) return false;
@@ -161,50 +154,42 @@ const Def* normalize_disj(const Def* type, const Def*, const Def* arg) {
     auto& world = type->world();
     if (auto a = Lit::isa(arg->arity())) {
         switch (*a) {
-            case 0: return world.lit_ff();
+            case 0: return {};
             case 1: return arg;
             default:
                 auto new_args = detail::flatten_in_arg<disj>(arg);
 
-                const bool contains_any
-                    = std::ranges::find_if(new_args, [](const Def* ax) -> bool { return Axm::isa<any>(ax); })
-                   != new_args.end();
-                const bool contains_empty
-                    = std::ranges::find_if(new_args, [](const Def* ax) -> bool { return Axm::isa<empty>(ax); })
-                   != new_args.end();
-
-                auto make_any = [&world, contains_empty]() {
-                    if (contains_empty)
-                        // (any|) matches everything, including empty string
-                        // don't normalize again, as we'd just run into this normalizer again..
-                        return world.call<disj, false>(Defs{world.annex<any>(), world.annex<empty>()});
-                    else
-                        return world.annex<any>();
+                // any only subsumes the single-character alternatives.
+                auto make_any = [&world](DefVec args) {
+                    std::erase_if(
+                        args, [](const Def* d) { return Axm::isa<range>(d) || Axm::isa<not_>(d) || Axm::isa<any>(d); });
+                    args.emplace_back(world.annex<any>());
+                    if (args.size() == 1) return args.front();
+                    make_vector_unique(args);
+                    return make_binary_tree<disj>(args);
                 };
 
-                if (contains_any) return make_any();
+                if (std::ranges::any_of(new_args, [](const Def* d) { return Axm::isa<any>(d); }))
+                    return make_any(new_args);
                 make_vector_unique(new_args);
                 merge_ranges(new_args);
 
-                const Def* to_remove = nullptr;
                 for (const auto* cls0 : new_args) {
                     for (const auto* cls1 : new_args)
-                        if (equals_any(cls0, cls1)) return make_any();
+                        if (equals_any(cls0, cls1)) return make_any(new_args);
 
                     if (auto not_rhs = Axm::isa<not_>(cls0)) {
                         if (auto disj_rhs = Axm::isa<disj>(not_rhs->arg())) {
                             auto rngs = detail::flatten_in_arg<disj>(disj_rhs->arg());
                             make_vector_unique(rngs);
-                            if (equals_any(new_args, rngs)) return make_any();
+                            if (equals_any(new_args, rngs)) return make_any(new_args);
                         }
                     }
                 }
 
-                erase(new_args, to_remove);
-                world.DLOG("final ranges {}", fe::Join(new_args));
+                world.log().d("final ranges: {}", fe::Join(new_args));
 
-                if (new_args.size() > 2) return make_binary_tree<disj>(new_args);
-                if (new_args.size() > 1) return world.call<disj, false>(new_args);
+                if (new_args.size() > 1) return make_binary_tree<disj>(new_args);
                 return new_args.back();
         }
     }
@@ -215,16 +200,13 @@ const Def* normalize_range(const Def* type, const Def* callee, const Def* arg) {
     auto& world     = type->world();
     auto [lhs, rhs] = arg->projs<2>();
 
-    if (!lhs->isa<Var>() && !rhs->isa<Var>()) // before first PE.
-        if (lhs->as<Lit>()->get() > rhs->as<Lit>()->get()) return world.raw_app(type, callee, {rhs, lhs});
+    if (auto l = Lit::isa(lhs), r = Lit::isa(rhs); l && r && *l > *r) return world.raw_app(type, callee, {rhs, lhs});
 
     return {};
 }
 
 const Def* any_unwanted_for_not(const Def* arg) {
-    if (auto ax = Axm::isa<regex::range>(arg)) return nullptr;
-    if (auto ax = Axm::isa<regex::not_>(arg)) return nullptr;
-    if (auto ax = Axm::isa<regex::any>(arg)) return nullptr;
+    if (Axm::isa<regex::range>(arg) || Axm::isa<regex::not_>(arg) || Axm::isa<regex::any>(arg)) return nullptr;
     if (auto disj = Axm::isa<regex::disj>(arg)) {
         for (const auto* disj_arg : disj->args())
             if (auto ret = any_unwanted_for_not(disj_arg)) return ret;
@@ -235,11 +217,10 @@ const Def* any_unwanted_for_not(const Def* arg) {
 
 const Def* normalize_not(const Def*, const Def* callee, const Def* arg) {
     if (auto unwanted = any_unwanted_for_not(arg)) {
-        throw Error()
-            .error(arg->loc(),
-                   "regex.not_ must only be used with regex.disj, regex.range, regex.any and regex.not_: {} {}", callee,
+        arg->blame("regex.not must only be used with regex.disj, regex.range, regex.any and regex.not: {} {}", callee,
                    arg)
-            .error(unwanted->loc(), "found unwanted: {}", unwanted);
+            .n("found unwanted: {}", unwanted)
+            .bail();
     }
     return {};
 }

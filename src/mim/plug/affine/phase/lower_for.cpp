@@ -1,8 +1,10 @@
 #include "mim/plug/affine/phase/lower_for.h"
 
+#include <mim/driver.h>
 #include <mim/lam.h>
 #include <mim/tuple.h>
 
+#include <mim/plug/ll/ll.h>
 #include <mim/plug/mem/mem.h>
 
 #include "mim/plug/affine/affine.h"
@@ -11,33 +13,28 @@ namespace mim::plug::affine::phase {
 
 namespace {
 
-const Def* merge_s(const Def* elem, const Def* sigma, const Def* mem) {
+const Def* merge(bool term, const Def* elem, const Def* prod, const Def* mem) {
     auto& w = elem->world();
-    if (mem) {
-        auto elems = sigma->projs();
-        return cat_sigma(elem, elems);
-    }
-    return w.sigma({elem, sigma});
-}
-
-const Def* merge_t(const Def* elem, const Def* tuple, const Def* mem) {
-    auto& w = elem->world();
-    if (mem) {
-        auto elems = tuple->projs();
-        return cat_tuple(elem, elems);
-    }
-    return w.tuple({elem, tuple});
+    if (mem) return w.prod(term, Def::cat(elem, prod->projs()));
+    return w.prod(term, {elem, prod});
 }
 
 } // namespace
 
 const Def* LowerFor::rewrite_imm_App(const App* app) {
-    if (is_bootstrapping()) return RWPhase::rewrite_imm_App(app);
-
     if (auto for_ax = Axm::isa<affine::For>(app)) {
-        DLOG("rewriting for axm: `{}`", for_ax);
+        log().d("lower for: {}", for_ax);
         auto [old_body, old_exit, args]               = for_ax->uncurry_args<3>();
         auto [new_begin, new_end, new_step, new_init] = args->projs<4>([this](const Def* def) { return rewrite(def); });
+
+        const Def* vec_axm = nullptr;
+        if (auto ll_vec = Axm::isa<ll::vec>(old_body)) {
+            old_body = ll_vec->arg();
+            if (old_world().driver().is_loaded("ll")) vec_axm = ll_vec->axm();
+        } else if (auto ll_novec = Axm::isa<ll::novec>(old_body)) {
+            old_body = ll_novec->arg();
+            if (old_world().driver().is_loaded("ll")) vec_axm = ll_novec->axm();
+        }
 
         auto old_body_lam = old_body->isa_mut<Lam>();
         auto old_exit_lam = old_exit->isa_mut<Lam>();
@@ -45,7 +42,8 @@ const Def* LowerFor::rewrite_imm_App(const App* app) {
         if (!old_exit_lam) old_exit_lam = Lam::eta_expand(old_exit);
 
         auto new_mem      = mem::mem_def(new_init);
-        auto new_head_lam = new_world().mut_con(merge_s(new_begin->type(), new_init->type(), new_mem))->set("head");
+        auto new_head_dom = merge(false, new_begin->type(), new_init->type(), new_mem);
+        auto new_head_lam = new_world().mut_con(new_head_dom)->set("head");
         auto new_phis     = new_head_lam->vars();
         auto new_iter     = new_phis.front();
         auto new_acc      = new_world().tuple(new_phis.view().subspan(1));
@@ -58,8 +56,10 @@ const Def* LowerFor::rewrite_imm_App(const App* app) {
         auto new_cmp   = new_world().call(core::icmp::ul, Defs{new_iter, new_end});
         auto new_inc   = new_world().call(core::wrap::add, core::Mode::nsuw, Defs{new_iter, new_step});
 
+        if (vec_axm) new_cmp = new_world().app(new_world().app(rewrite(vec_axm), new_cmp->type()), new_cmp);
+
         new_head_lam->branch(false, new_cmp, new_body, new_exit, new_mem);
-        new_yield->app(false, new_head_lam, merge_t(new_inc, new_yield->var(), new_mem));
+        new_yield->app(false, new_head_lam, merge(true, new_inc, new_yield->var(), new_mem));
 
         // `new_acc` references the head's phis, including the head's mem var.
         // Each new bb receives its own mem, so re-thread the acc's mem through the bb's own mem var.
@@ -72,21 +72,21 @@ const Def* LowerFor::rewrite_imm_App(const App* app) {
             return new_world().tuple(elems);
         };
 
-        push();
+        push(Vars(old_body_lam->has_var()));
         map(old_body_lam->var(), {new_iter, acc_for(new_body), new_yield});
         auto new_body_filter = rewrite(old_body_lam->filter());
         auto new_body_value  = rewrite(old_body_lam->body());
         new_body->set({new_body_filter, new_body_value});
         pop();
 
-        push();
+        push(Vars(old_exit_lam->has_var()));
         map(old_exit_lam->var(), acc_for(new_exit));
         auto new_exit_filter = rewrite(old_exit_lam->filter());
         auto new_exit_value  = rewrite(old_exit_lam->body());
         new_exit->set({new_exit_filter, new_exit_value});
         pop();
 
-        return new_world().app(new_head_lam, merge_t(new_begin, new_init, new_mem));
+        return new_world().app(new_head_lam, merge(true, new_begin, new_init, new_mem));
     }
 
     return RWPhase::rewrite_imm_App(app);
