@@ -1,0 +1,13 @@
+plugin core;
+
+cfun dont_know[]: Nat;
+
+fun extern same_tree_b(a: Nat): Nat =
+    ret c = dont_know $ ();
+    let b = %core.ncmp.l (c, a);
+    let u = %core.ncmp.l (a, 5);
+    (f, t)#b () where
+        con t() = (return, j)#u c;
+        con f() = return (%core.nat.add (c, 1));
+        con j(x: Nat) = return (%core.nat.add (x, a));
+    end;
